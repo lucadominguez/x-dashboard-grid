@@ -146,42 +146,41 @@ def main():
             url = 'http://%s:%d/%s' % (HOST, PORT, 'fixture.html')
             page.goto(url, wait_until='load', timeout=30000)
 
-            # --- Check 1: grid exists --------------------------------------
+            # --- Check 1: grid overlay exists --------------------------------
             ok1 = wait_for(lambda: page.evaluate(
                 "() => !!document.querySelector('#gridx-root')"))
-            results.append(('1. gridx-root element exists', ok1))
+            results.append(('1. gridx overlay element exists', ok1))
 
-            # --- Check 2: >= 20 articles hoisted ---------------------------
-            def grid_count():
-                return page.evaluate(
-                    "() => document.querySelectorAll('#gridx-root article').length")
-            ok2 = wait_for(lambda: grid_count() >= 20)
-            count_start = grid_count()
-            results.append(('2. at least 20 articles hoisted (%d)' % count_start, ok2))
+            # --- Check 2: stream host found + >= 20 articles present ---------
+            def host_count():
+                return page.evaluate("""() => {
+                    const h = document.querySelector('.gx-stream');
+                    return h ? h.querySelectorAll('article[data-testid="tweet"], article').length : -1;
+                }""")
+            ok2 = wait_for(lambda: host_count() >= 20)
+            count_start = host_count()
+            results.append(('2. stream host + >=20 articles (%d)' % count_start, ok2))
 
-            # --- Check 3: default columns == 3 ------------------------------
+            # --- Check 3: default CSS columns on the host == 3 ----------------
             def col_count():
-                return page.evaluate(
-                    "() => { const el = document.querySelector('#gridx-root');"
-                    " if (!el) return 0;"
-                    " return getComputedStyle(el).gridTemplateColumns"
-                    "   .split(/\\s+/).filter(Boolean).length; }")
+                return page.evaluate("""() => {
+                    const h = document.querySelector('.gx-stream');
+                    if (!h) return 0;
+                    return getComputedStyle(h).gridTemplateColumns
+                        .split(/\\s+/).filter(Boolean).length;
+                }""")
             cols = col_count()
-            results.append(('3. grid has configured columns (got %d, want 3)' % cols,
+            results.append(('3. host has configured columns (got %d, want 3)' % cols,
                             cols == 3))
 
-            # --- Check 4: load more grows the grid (MutationObserver) ------
-            before = grid_count()
-            # The fixed, full-viewport grid overlays the fixture button, so
-            # Playwright's clickability gate would block a normal click. Fire
-            # the button's handler directly; the MutationObserver reaction is
-            # exactly what we are testing.
+            # --- Check 4: load more grows the hosted grid (MutationObserver) ---
+            before = host_count()
             page.evaluate("() => document.getElementById('load-more').click()")
-            ok4 = wait_for(lambda: grid_count() == before + 5)
+            ok4 = wait_for(lambda: host_count() == before + 5)
             results.append(
-                ('4. load more grows grid (%d -> %d)' % (before, grid_count()), ok4))
+                ('4. load more grows grid (%d -> %d)' % (before, host_count()), ok4))
 
-            # --- Check 5: gridx:update columnCount=4 ------------------------
+            # --- Check 5: gridx:update columnCount=4 --------------------------
             page.evaluate(
                 "() => document.dispatchEvent(new CustomEvent('gridx:update',"
                 " { detail: { columnCount: 4 } }))")
@@ -189,17 +188,18 @@ def main():
             results.append(
                 ('5. gridx:update columnCount=4 -> %d columns' % cols5, cols5 == 4))
 
-            # --- Check 6: keyword filter hides matching posts ---------------
+            # --- Check 6: keyword filter hides matching posts ------------------
             page.evaluate(
                 "() => document.dispatchEvent(new CustomEvent('gridx:update',"
                 " { detail: { filterKeywords: ['banana'] } }))")
             def filter_stats():
                 return page.evaluate("""() => {
-                    const cells = Array.from(document.querySelectorAll('#gridx-root .gx-cell'));
-                    const banana = cells.filter(c => (c.textContent||'').includes('banana'));
-                    const hiddenBanana = banana.filter(c => c.classList.contains('gx-hidden'));
-                    return { total: banana.length, hidden: hiddenBanana.length,
-                             visible: cells.filter(c=>!c.classList.contains('gx-hidden')).length };
+                    const h = document.querySelector('.gx-stream');
+                    const arts = h ? Array.from(h.querySelectorAll('article[data-testid="tweet"], article')) : [];
+                    const banana = arts.filter(a => (a.innerText||a.textContent||'').includes('banana'));
+                    const hiddenBanana = banana.filter(a => a.classList.contains('gx-hidden'));
+                    const visible = arts.filter(a => !a.classList.contains('gx-hidden')).length;
+                    return { total: banana.length, hidden: hiddenBanana.length, visible: visible };
                 }""")
             fs = filter_stats()
             ok6 = (fs['total'] > 0 and fs['hidden'] == fs['total'])
@@ -207,7 +207,7 @@ def main():
                 ('6. keyword filter hides %d/%d banana posts (visible now %d)'
                  % (fs['hidden'], fs['total'], fs['visible']), ok6))
 
-            # --- Check 7: scan mode adds gridx-scan to <html> ---------------
+            # --- Check 7: scan mode adds gridx-scan to <html> ------------------
             page.evaluate(
                 "() => document.dispatchEvent(new CustomEvent('gridx:update',"
                 " { detail: { scanMode: true } }))")

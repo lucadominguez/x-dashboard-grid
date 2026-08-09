@@ -1,25 +1,33 @@
 /* ============================================================================
- * GridX content script
+ * GridX content script — "CSS re-flow" architecture
  * ----------------------------------------------------------------------------
- * Strategy: "DOM hoisting", fully read-only with respect to Twitter/X's data.
+ * v0.2: pivot from "DOM hoisting" (moving <article> nodes) to re-flowing X's
+ * own timeline IN PLACE via CSS. This is a direct response to two real-world
+ * failures of the hoisting build on live x.com:
  *
- *  - We never call the X API, never read cookies, never write replies/RTs,
- *    never programmatically scroll or auto-fetch. We take the articles X has
- *    already rendered and re-parent them into our own #gridx-root CSS grid.
- *  - The source of truth stays X's DOM. X is the owner: a MutationObserver on
- *    the primary column reacts to X's infinite-scroll additions/removals.
- *  - Removed articles go to a hidden STASH, not to GC, because X's React event
- *    handlers / observers still hold references to those nodes. Destroying them
- *    could make X throw. Stashing keeps the exact node alive and lets us
- *    re-parent the SAME node back into the grid if X re-inserts it.
- *  - Selectors are layered fallbacks because X's markup churns. If nothing
- *    matches, we show a clear overlay and never break X.
- *  - We run in the ISOLATED world. We style our own wrapper classes
- *    (#gridx-root, .gx-cell) and use !important where X's styles would fight
- *    us. We do not depend on any of X's class names for styling.
- *  - Settings live in chrome.storage.local under one `gridxSettings` object.
+ *   1. RATE-LIMIT/block: hoisting EMPTIES X's timeline container, so X's
+ *      infinite-scroll sentinel is always "in view" and X fires page-after-page
+ *      of requests with no human scroll cadence -> temporary rate limit.
+ *   2. OVERLAP: re-parenting tore articles out of X's grid/flex context and we
+ *      aggressively overrode their internals (`all:unset`), which X's action-row
+ *      icons/avatars depend on, causing the overlap you saw.
  *
- * Debug logging is behind settings.debug and always prefixed [gridx].
+ * New model: GridX does NOT move or destroy any node. It finds the container
+ * X already uses for the timeline and applies `display:grid` +
+ * `grid-template-columns: repeat(N, ...)` to it. X keeps ownership of scroll,
+ * pagination, virtualization, clicks and layout, so:
+ *   - X's sentinel stays in a real container -> normal human-scroll pagination,
+ *     no rate-limit storm.
+ *   - Articles keep native internals -> no icon overlap.
+ *   - Clicking a post's text opens the real status (delegated <a> user gesture).
+ *
+ * GridX still: never calls the X API, never reads cookies, never writes,
+ * never auto-scrolls, never fetches anything X wouldn't. It only styles/classes
+ * the DOM and holds settings counter. `#gridx-root` is now a NON-interactive
+ * overlay (pointer-events:none) carrying the filter bar / keymap / status /
+ * fatal chrome; the real grid lives on X's own `.gx-stream` container.
+ *
+ * Debug logs are behind settings.debug, prefixed [gridx].
  * ========================================================================== */
 (() => {
   'use strict';
@@ -31,8 +39,7 @@
   const STATS_KEY = 'gridxStats';
 
   /* ------------------------------------------------------------------ *
-   * Defaults & selector candidates (layered fallbacks).
-   * Each list is ordered; we feature-detect / matches() any of them.
+   * Defaults & layered selector candidates (X churns its markup).
    * ------------------------------------------------------------------ */
   const DEFAULTS = {
     columnCount: 3,
@@ -53,44 +60,41 @@
   };
 
   const S = {
-    // Primary timeline container. X has replaced many selectors over the years;
-    // keep several layers.
     primaryColumn: [
       '[data-testid="primaryColumn"]',
       'main section',
       'main[role="main"]',
     ],
     article: ['article[data-testid="tweet"]', 'article'],
+    // Stream host candidate edges: containers we must NOT turn into a grid.
+    notHost: [
+      '[data-testid="primaryColumn"]',
+      '[data-testid="sidebarColumn"]',
+      '[data-testid="TopBar"]',
+      '[data-testid="topBar"]',
+      'header',
+      'nav',
+      'main',
+      'body',
+      'html',
+    ],
     statusLink: ['a[href*="/status/"]'],
-    avatar: ['[data-testid="UserAvatar-Container"] img', 'img[src*="profile_images"]'],
-    tweetText: ['[data-testid="tweetText"]'],
-    actions: ['[role="group"]'],
     sponsored: ['a[aria-label*="sponsored"]'],
-    tweetPhoto: ['[data-testid="tweetPhoto"]'],
-    video: ['[data-testid="videoPlayer"]', 'video'],
-    tombstone: ['[data-testid="tombstone"]'], // quoted-tweet container
     verified: ['[data-testid="icon-verified"]', 'svg[aria-label*="Verified"]'],
+    metricButtons: ['[role="group"] [role="button"]', '[role="button"]'],
   };
+
+  const ARTICLE = S.article.join(', ');
+  const STATUS_LINK = S.statusLink.join(', ');
+  const HIDE_CHROME = S.primaryColumn.join(', ');
 
   const SCAN_KEYS = [
     'columnCount', 'density', 'showAvatars', 'showMedia', 'showMetrics', 'fontScale',
   ];
-  // Scan = absolute maximum information transfer.
   const SCAN_OVERRIDES = {
-    columnCount: 8,
-    density: 'compact',
-    showAvatars: false,
-    showMedia: false,
-    showMetrics: false,
-    fontScale: 0.9,
+    columnCount: 8, density: 'compact', showAvatars: false,
+    showMedia: false, showMetrics: false, fontScale: 0.9,
   };
-
-  const ARTICLE_MATCHER = S.article.join(', ');
-  const STATUS_LINK_MATCHER = S.statusLink.join(', ');
-  const PHOTO_MATCHER = S.tweetPhoto.join(', ');
-  const VIDEO_MATCHER = S.video.join(', ');
-  const SPONSORED_MATCHER = S.sponsored.join(', ');
-  const TOMBSTONE_MATCHER = S.tombstone.join(', ');
 
   /* ------------------------------------------------------------------ *
    * State
@@ -98,31 +102,26 @@
   let settings = { ...DEFAULTS };
   let active = false;
   let paused = false;
-  let primaryEl = null;
+  let host = null;            // X's timeline container we columnize
+  let savedStyles = null;     // host inline styles captured before changes
   let observer = null;
-  let root = null;
-  let filterBar = null;
+  let root = null;            // non-interactive overlay chrome
   let filterInput = null;
-  let statusBar = null;
   let hintsEl = null;
   let statsEl = null;
   let keymapEl = null;
-  let stashEl = null;
   let fatalEl = null;
-  let extraCssEl = null;
-  let cellRegistry = null; // WeakMap<article, cell>
-  let cursorCell = null;
-  let prevSettings = null; // pre-scan snapshot for restore
+  let cursorArticle = null;
+  let prevSettings = null;
   let statTimer = null;
   let lastStatusTimer = null;
-  let lastFilterValue = '';
 
   const stats = { postsRendered: 0, postsFiltered: 0, gridActiveMs: 0, columnCount: 3 };
 
   const log = (...a) => { if (settings.debug) console.log('[' + NS + ']', ...a); };
   const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number(v) || lo)));
   const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
-  const pick = (obj, keys) => { const o = {}; for (const k of keys) o[k] = obj[k]; return o; };
+  const pick = (o, keys) => { const r = {}; for (const k of keys) r[k] = o[k]; return r; };
 
   /* ------------------------------------------------------------------ *
    * Storage
@@ -131,604 +130,363 @@
     try {
       const o = await chrome.storage.local.get(STORAGE_KEY);
       settings = { ...DEFAULTS, ...(o[STORAGE_KEY] || {}) };
-    } catch (e) {
-      settings = { ...DEFAULTS };
-      log('storage unavailable, using defaults', e);
-    }
+    } catch (e) { settings = { ...DEFAULTS }; }
   }
-
   function saveSettings() {
-    try { chrome.storage.local.set({ [STORAGE_KEY]: settings }); } catch (e) { /* noop */ }
+    try { chrome.storage.local.set({ [STORAGE_KEY]: settings }); } catch (e) {}
   }
-
   function persistCounters() {
-    try { chrome.storage.local.set({ [STATS_KEY]: { ...stats } }); } catch (e) { /* noop */ }
+    try { chrome.storage.local.set({ [STATS_KEY]: { ...stats } }); } catch (e) {}
   }
-
   async function loadCounters() {
     try {
       const o = await chrome.storage.local.get(STATS_KEY);
-      if (o[STATS_KEY]) {
-        stats.postsRendered = o[STATS_KEY].postsRendered || 0;
-        stats.postsFiltered = o[STATS_KEY].postsFiltered || 0;
-        stats.gridActiveMs = o[STATS_KEY].gridActiveMs || 0;
-      }
-    } catch (e) { /* noop */ }
+      if (o[STATS_KEY]) Object.assign(stats, o[STATS_KEY]);
+    } catch (e) {}
   }
 
   /* ------------------------------------------------------------------ *
-   * Selector helpers
+   * DOM helpers
    * ------------------------------------------------------------------ */
-  const elMatches = (el, sel) => (el instanceof Element) && sel && el.matches(sel);
-  function isArticle(el) { return elMatches(el, ARTICLE_MATCHER); }
-  function findPrimary() {
-    for (const sel of S.primaryColumn) {
-      const el = document.querySelector(sel);
-      if (el) return el;
-    }
-    return null;
-  }
-  function hasAny(article, sel) {
-    if (!article) return false;
-    return sel && (article.matches(sel) || article.querySelector(sel) != null);
-  }
-  function primaryUrl(article) {
-    const a = article.querySelector(STATUS_LINK_MATCHER);
-    return a ? a.href : '';
-  }
-  function isSponsor(article) { return hasAny(article, SPONSORED_MATCHER); }
-  function isVideo(article) { return hasAny(article, VIDEO_MATCHER); }
-  function isImage(article) { return hasAny(article, PHOTO_MATCHER); }
-  function isQuote(article) { return hasAny(article, TOMBSTONE_MATCHER); }
-  function isVerified(article) { return hasAny(article, S.verified.join(', ')); }
-  function isRetweet(article) {
-    return article && /reposted|repost/i.test(article.innerText || '');
-  }
-  function repostUser(article) {
-    const m = /reposted[\s\S]{0,40}?@?([A-Za-z0-9_.]{1,50})/i.exec(article.innerText || '');
-    return m ? '@' + m[1] : '';
-  }
-  function mediaType(article) {
-    if (isVideo(article)) return 'video';
-    const img = article.querySelector(PHOTO_MATCHER + ' img');
-    const src = (img && (img.src || '')) || '';
-    if (/\.gif/i.test(src) || /prfx|media.*gif/i.test(src)) return 'gif';
-    return 'image';
+  const isEl = (n) => n instanceof Element;
+  function matchesAny(el, sel) { return isEl(el) && el.matches(sel); }
+  function selNotHost(el) {
+    if (!isEl(el)) return true;
+    for (const s of S.notHost) if (el.matches(s)) return true;
+    return false;
   }
 
   /* ------------------------------------------------------------------ *
-   * DOM scaffolding
+   * Overlay chrome (filter bar, keymap, fatal, status, extra-css injector)
+   * Purely presentational; pointer-events:none so it never blocks X content.
    * ------------------------------------------------------------------ */
-  function ensureDom() {
+  function ensureOverlay() {
     if (root) return;
     root = document.createElement('div');
     root.id = 'gridx-root';
     root.innerHTML = `
       <div id="gridx-filterbar">
         <span class="gx-fb-tag">filter:</span>
-        <input id="gridx-filter-input" type="text" placeholder="terms hide posts · -term = only those · Enter apply · Esc clear" autocomplete="off" spellcheck="false" />
-      </div>
-      <div id="gridx-statusbar">
-        <span class="gx-hints"></span>
-        <span class="gx-stats"></span>
+        <input id="gridx-filter-input" type="text"
+          placeholder="terms hide posts · -term keeps only those · Enter apply · Esc clear"
+          autocomplete="off" spellcheck="false" />
       </div>
       <div id="gridx-keymap" hidden>
         <h2>GridX keyboard map</h2>
         <table>
-          <tr><td>j / k</td><td>next / previous post</td></tr>
-          <tr><td>↓ / ↑</td><td>next / previous post</td></tr>
-          <tr><td>h / l</td><td>previous / next column</td></tr>
+          <tr><td>j / k · ↓ / ↑</td><td>next / previous post</td></tr>
           <tr><td>g / G</td><td>top / bottom</td></tr>
           <tr><td>d / u</td><td>half page down / up</td></tr>
           <tr><td>Space / Shift+Space</td><td>page down / up</td></tr>
-          <tr><td>Enter</td><td>open current post in a new tab</td></tr>
-          <tr><td>o</td><td>open current post in the same tab</td></tr>
+          <tr><td>Enter</td><td>open post in a new tab</td></tr>
+          <tr><td>o</td><td>open post in same tab</td></tr>
           <tr><td>Backspace</td><td>go back</td></tr>
-          <tr><td>x</td><td>expand / collapse current post text</td></tr>
-          <tr><td>m</td><td>toggle media on current post</td></tr>
-          <tr><td>f</td><td>focus filter bar</td></tr>
-          <tr><td>s</td><td>toggle scan mode</td></tr>
-          <tr><td>p</td><td>pause / resume grid</td></tr>
-          <tr><td>?</td><td>show / hide this overlay</td></tr>
-          <tr><td>Esc</td><td>close overlay / clear cursor</td></tr>
+          <tr><td>f / s / p</td><td>focus filter / scan / pause</td></tr>
+          <tr><td>? / Esc</td><td>keymap overlay / close</td></tr>
+          <tr><td>Click post</td><td>open the real post in a new tab</td></tr>
         </table>
-        <p style="font-size:11px;color:var(--gx-muted)">Keys are ignored while typing in a text field.</p>
+        <p class="gx-km-note">Keys are ignored while typing.</p>
       </div>
       <div id="gridx-fatal" hidden>
         <h1>GridX: timeline not found</h1>
-        <p>GridX could not locate the primary column or tweet articles on this page.</p>
-        <p>This usually means X shipped a markup change, or you are on a page without a feed.</p>
+        <p>GridX could not locate the timeline container on this page.</p>
+        <p>This usually means X shipped a markup change, or you are not on a feed.</p>
         <button id="gridx-fatal-close">Close GridX</button>
       </div>
-      <div id="gridx-stash"></div>
+      <div id="gridx-statusbar"><span class="gx-hints"></span><span class="gx-stats"></span></div>
     `;
     document.body.appendChild(root);
 
-    filterBar = root.querySelector('#gridx-filterbar');
     filterInput = root.querySelector('#gridx-filter-input');
-    statusBar = root.querySelector('#gridx-statusbar');
     hintsEl = root.querySelector('.gx-hints');
     statsEl = root.querySelector('.gx-stats');
     keymapEl = root.querySelector('#gridx-keymap');
-    stashEl = root.querySelector('#gridx-stash');
     fatalEl = root.querySelector('#gridx-fatal');
-    cellRegistry = new WeakMap();
 
-    filterInput.addEventListener('input', () => {
-      // Live demo of keyword matching while typing (applied on Enter, but we
-      // preview the hide-set here so typing feels responsive).
-      setKeywordFilter(previewTerms());
-    });
+    filterInput.addEventListener('input', () => setKeywordFilter(previewTerms(), true));
     filterInput.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        filterInput.blur();
-        setKeywordFilter(previewTerms());
-        setStatus('filter applied');
-      } else if (e.key === 'Escape') {
-        e.preventDefault();
-        clearFilter('cleared filter');
-      }
+      if (e.key === 'Enter') { e.preventDefault(); filterInput.blur(); setKeywordFilter(previewTerms(), false); setStatus('filter applied'); }
+      else if (e.key === 'Escape') { e.preventDefault(); clearFilter('cleared filter'); }
     });
-
-    root.addEventListener('click', (e) => {
-      const chip = e.target.closest('.gx-chip-media');
-      if (chip) {
-        e.preventDefault(); e.stopPropagation();
-        const cell = chip.closest('.gx-cell');
-        if (cell) toggleMedia(cell);
-        return;
-      }
-      const ovf = e.target.closest('.gx-overflow');
-      if (ovf) {
-        e.preventDefault(); e.stopPropagation();
-        const cell = ovf.closest('.gx-cell');
-        if (cell) toggleExpand(cell);
-        return;
-      }
-      const cell = e.target.closest('.gx-cell');
-      if (!cell) return;
-      // Ignore clicks that land on a link or interactive X control.
-      if (e.target.closest('a, [role="link"], [role="button"], video, img, input, textarea')) return;
-      toggleExpand(cell);
-    });
-
-    const closeBtn = root.querySelector('#gridx-fatal-close');
-    closeBtn.addEventListener('click', () => { deactivate(); });
+    root.querySelector('#gridx-fatal-close').addEventListener('click', () => deactivate());
   }
 
-  function showFatal(msg) {
-    if (!root) return;
-    const p = fatalEl.querySelectorAll('p');
-    if (msg && p[1]) p[1].textContent = msg;
-    fatalEl.hidden = false;
-  }
-  function hideFatal() { if (fatalEl) fatalEl.hidden = true; }
-
-  /* ------------------------------------------------------------------ *
-   * Cell creation (annotations + re-parenting)
-   * ------------------------------------------------------------------ */
-  function addChip(cell, text, cls) {
-    const c = document.createElement('span');
-    c.className = 'gx-chip ' + (cls || '');
-    c.textContent = text;
-    cell.appendChild(c);
-    return c;
-  }
-
-  function makeCell(article) {
-    const cell = document.createElement('div');
-    cell.className = 'gx-cell';
-    cell.dataset.gxCell = '1';
-    const url = primaryUrl(article);
-    if (url) cell.dataset.gxUrl = url;
-
-    // Annotation badges BEFORE the article so they read as a meta row.
-    if (isRetweet(article)) {
-      cell.classList.add('gx-rt');
-      addChip(cell, '↻ ' + repostUser(article), 'gx-chip-rt');
-    }
-    if (isSponsor(article)) {
-      cell.classList.add('gx-ad');
-      addChip(cell, 'AD', 'gx-chip-ad');
-    }
-    if (isImage(article) || isVideo(article)) {
-      cell.classList.add('gx-media');
-      addChip(cell, '[' + mediaType(article) + ']', 'gx-chip-media');
-    }
-    if (isVerified(article)) cell.classList.add('gx-verified');
-    if (isQuote(article)) addChip(cell, '❝ quote', 'gx-chip-quote');
-
-    // Overflow button, top-right.
-    const ovf = document.createElement('button');
-    ovf.className = 'gx-overflow';
-    ovf.setAttribute('aria-label', 'More');
-    ovf.textContent = '≡';
-    cell.appendChild(ovf);
-
-    // Re-parent the SAME article node. X remains the source of truth.
-    article.dataset.gxHoisted = '1';
-    cell.appendChild(article);
-    return cell;
-  }
-
-  function ensureCellFor(article) {
-    if (cellRegistry.has(article)) {
-      const c = cellRegistry.get(article);
-      if (c && c.isConnected) return c;
-    }
-    const c = makeCell(article);
-    cellRegistry.set(article, c);
-    return c;
+  function ensureExtraCssEl() {
+    let el = document.getElementById('gridx-extra-css');
+    if (!el) { el = document.createElement('style'); el.id = 'gridx-extra-css'; document.head.appendChild(el); }
+    return el;
   }
 
   /* ------------------------------------------------------------------ *
-   * Hoisting / stashing
+   * Stream-host detection.
+   * Finds the container whose direct children each wrap the tweets (X's own
+   * timeline div, or the fixture's #stream). Returns null if none — the grid
+   * then stays off and we never break X.
    * ------------------------------------------------------------------ */
-  function hoistArticle(article) {
-    // If the article already lives inside our grid, nothing to do (save for a
-    // filter refresh). Otherwise (re-)wrap and re-parent.
-    if (root.contains(article)) { refreshCellFor(article); return; }
-    const cell = ensureCellFor(article);
-    if (!root.contains(cell)) root.appendChild(cell);
-    cell.dataset.gxUrl = primaryUrl(article) || cell.dataset.gxUrl || '';
-    refreshCellFor(article);
-  }
-
-  function refreshCellFor(article) {
-    // Recompute visibility + keep annotations fresh if the node changed.
-    const cell = cellRegistry.get(article);
-    if (!cell) return;
-    cell.classList.toggle('gx-ad', isSponsor(article));
-    if (cell.querySelector('.gx-chip-media')) {
-      cell.querySelector('.gx-chip-media').textContent = '[' + mediaType(article) + ']';
+  function isStreamHost(el) {
+    if (!isEl(el) || selNotHost(el)) return false;
+    const kids = Array.from(el.children);
+    if (kids.length < 3) return false;
+    let withArticle = 0;
+    for (const k of kids) {
+      // A child may be the tweet itself (fixture) or a wrapper that CONTAINS
+      // one (X's [data-testid="cellInnerDiv"]). Check both.
+      if (k.matches && k.matches(ARTICLE)) withArticle++;
+      else if (k.querySelector && k.querySelector(ARTICLE)) withArticle++;
     }
+    return withArticle >= 2 && withArticle >= kids.length * 0.5;
   }
 
-  function stashArticle(article) {
-    // Park the node, do not destroy it (X's observer contract).
-    if (article.parentElement && article.parentElement.classList.contains('gx-cell')) {
-      article.parentElement.remove();
+  function findHost() {
+    const first = document.querySelector(ARTICLE);
+    if (!first) return null;
+    let el = first.parentElement;
+    while (el && el !== document.documentElement) {
+      if (isStreamHost(el)) return el;
+      // skip single-article wrappers (X's [data-testid="cellInnerDiv"])
+      el = el.parentElement;
     }
-    stashEl.appendChild(article);
-  }
-
-  function collectArticles(container) {
-    return Array.from(container.querySelectorAll(ARTICLE_MATCHER));
-  }
-
-  function hoistAll(pc) {
-    for (const a of collectArticles(pc)) hoistArticle(a);
-    updateFilters();
-    updateStatsReadout();
+    // fallback: nearest scrollable ancestor of the first article
+    let s = first.parentElement;
+    while (s && !(s.scrollWidth > s.clientWidth || s.scrollHeight > s.clientHeight)) s = s.parentElement;
+    return s && s !== document.documentElement ? s : null;
   }
 
   /* ------------------------------------------------------------------ *
-   * MutationObserver (X owns the DOM; we react and re-parent)
+   * Host grid application
    * ------------------------------------------------------------------ */
-  function wireObserver(pc) {
-    if (observer) observer.disconnect();
-    primaryEl = pc;
-    observer = new MutationObserver(onMutate);
-    observer.observe(pc, { childList: true, subtree: true });
+  function applyGrid() {
+    if (!host) return;
+    const cols = clampInt(settings.columnCount, 1, 8);
+    stats.columnCount = cols;
+    const gap = (settings.bleed ? 0 : 6) * densityScale();
+
+    // Capture + apply inline styles. We mutate the host minimally and keep a
+    // snapshot so `deactivate()` can restore X exactly.
+    host.classList.add('gx-stream');
+    host.setAttribute('data-gx-stream', '1');
+    setInline('display', 'grid');
+    setInline('gridTemplateColumns', 'repeat(' + cols + ', minmax(0, 1fr))');
+    setInline('alignContent', 'start');
+    setInline('alignItems', 'start');
+    setInline('columnGap', gap + 'px');
+    setInline('rowGap', gap + 'px');
+    setInline('overflowY', 'auto');
+    setInline('overflowX', 'hidden');
+    setInline('overscrollBehavior', 'contain');
+    setInline('scrollBehavior', 'auto');
+    // Make sure the grid has room to scroll within the viewport. If the host
+    // is already a scroller (real X), leave its height alone; otherwise (e.g.
+    // the flat fixture `#stream`) constrain it so vertical scrolling works.
+    if (host.scrollHeight <= host.clientHeight) setInline('height', '100vh');
+
+    // Density / font-scale as CSS vars cascading into articles.
+    const fs = clampNum(settings.fontScale, 0.8, 1.4);
+    document.documentElement.style.setProperty('--gx-font-scale', fs.toFixed(2));
+    document.documentElement.style.setProperty('--gx-density', densityScale().toFixed(2));
+    document.documentElement.classList.toggle('gx-hide-avatar', settings.showAvatars === false);
+    document.documentElement.classList.toggle('gx-hide-media', settings.showMedia === false);
+    document.documentElement.classList.toggle('gx-hide-metrics', settings.showMetrics === false);
+    document.documentElement.classList.toggle('gx-hide-promoted', !!settings.hidePromoted);
+    document.documentElement.classList.toggle('gx-hide-rt', !!settings.hideRetweets);
+    document.documentElement.classList.toggle('gx-hide-verified', !!settings.hideVerified);
+    document.documentElement.classList.toggle('gx-bleed', !!settings.bleed);
+
+    applyScanClass();
   }
 
-  function onMutate(records) {
-    if (paused) return; // paused = observer disconnected anyway
-    const pc = findPrimary();
-    if (pc && pc !== primaryEl) {
-      // X replaced the primary container wholesale.
-      wireObserver(pc);
-      hoistAll(pc);
+  function densityScale() {
+    return { compact: 1, cozy: 1.35, roomy: 1.75 }[settings.density] || 1;
+  }
+
+  function setInline(prop, value) {
+    if (savedStyles && !(prop in savedStyles)) savedStyles[prop] = host.style[prop] || '';
+    host.style[prop] = value;
+  }
+
+  function restoreHost() {
+    if (!host || !savedStyles) return;
+    for (const prop of Object.keys(savedStyles)) {
+      if (savedStyles[prop] === '') host.style.removeProperty(prop);
+      else host.style[prop] = savedStyles[prop];
     }
-    for (const rec of records) {
-      for (const node of rec.addedNodes) {
-        if (!(node instanceof Element)) continue;
-        handleAdded(node);
-      }
-      for (const node of rec.removedNodes) {
-        if (!(node instanceof Element)) continue;
-        handleRemoved(node);
-      }
-    }
-    updateFilters();
-    updateStatsReadout();
-  }
-
-  function handleAdded(node) {
-    if (isArticle(node)) { handleAddedArticle(node); return; }
-    for (const a of node.querySelectorAll(ARTICLE_MATCHER)) handleAddedArticle(a);
-  }
-
-  function handleAddedArticle(a) {
-    if (a.dataset.gxHoisting === '1') return; // our own mid-move
-    if (a.dataset.gxHoisted === '1') {
-      // X re-inserted a node we know. If it's not already in our grid, re-hoist
-      // the exact same node from the stash (source-of-truth stays X).
-      if (!root.contains(a)) hoistArticle(a);
-      return;
-    }
-    hoistArticle(a);
-  }
-
-  function handleRemoved(node) {
-    if (isArticle(node)) { handleRemovedArticle(node); return; }
-    for (const a of node.querySelectorAll(ARTICLE_MATCHER)) handleRemovedArticle(a);
-  }
-
-  function handleRemovedArticle(a) {
-    if (a.dataset.gxHoisted !== '1') return; // never ours
-    // If the node is already inside our grid, this removal is OUR OWN move
-    // (we took it out of primaryColumn to put it in a cell) - ignore.
-    if (root.contains(a)) return;
-    stashArticle(a);
+    host.classList.remove('gx-stream');
+    host.removeAttribute('data-gx-stream');
+    savedStyles = null;
   }
 
   /* ------------------------------------------------------------------ *
-   * Filters
+   * Per-article markings + filters (no re-parenting, no removal)
    * ------------------------------------------------------------------ */
-  const isEditableTarget = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
-
-  function previewTerms() {
-    return (filterInput ? filterInput.value : lastFilterValue).split(/[\s,]+/).filter(Boolean);
+  function markArticle(a) {
+    if (!a.dataset.gxUrl) {
+      const link = a.querySelector(STATUS_LINK);
+      if (link) a.dataset.gxUrl = link.href;
+    }
   }
 
-  function setKeywordFilter(terms) {
-    settings.filterKeywords = terms;
-    lastFilterValue = terms.join(' ');
-    if (filterInput && filterInput.value !== lastFilterValue) filterInput.value = lastFilterValue;
-    runFilters();
-    persistFilterBadge();
-    saveSettings();
-  }
-  function persistFilterBadge() {
-    const tag = filterBar ? filterBar.querySelector('.gx-fb-tag') : null;
-    if (!tag) return;
-    tag.textContent = settings.filterKeywords.length
-      ? 'filter(' + settings.filterKeywords.length + '):'
-      : 'filter:';
-  }
-  function clearFilter(msg) {
-    if (filterInput) filterInput.value = '';
-    settings.filterKeywords = [];
-    lastFilterValue = '';
-    runFilters();
-    persistFilterBadge();
-    saveSettings();
-    if (msg) setStatus(msg);
+  function articles() {
+    return host ? Array.from(host.querySelectorAll(ARTICLE)) : [];
   }
 
-  // Which words count as "matching" for a hide-term / keep-term.
+  function isSponsor(a) { return !!a.querySelector(S.sponsored.join(', ')); }
+  function isRetweeted(a) { return /reposted/i.test(a.innerText || ''); }
+  function isVerified(a) { return !!a.querySelector(S.verified.join(', ')); }
+
   function termHides(text, terms) {
     for (const raw of terms || []) {
-      const t = raw.trim().toLowerCase();
+      const t = (raw || '').trim().toLowerCase();
       if (!t) continue;
-      if (t[0] === '-') {
-        // "-term" = include-only: hide everything EXCEPT posts containing term.
-        const rest = t.slice(1);
-        if (rest && !text.includes(rest)) return true;
-      } else if (text.includes(t)) {
-        return true;
-      }
+      if (t[0] === '-') { const rest = t.slice(1); if (rest && !text.includes(rest)) return true; }
+      else if (text.includes(t)) return true;
     }
     return false;
   }
 
-  function getCells() {
-    return root ? Array.from(root.querySelectorAll('.gx-cell')) : [];
-  }
-
-  function updateFilters() {
-    if (!root) return;
+  function recomputeFilters() {
+    if (!host) return;
     let hidden = 0;
-    for (const cell of getCells()) {
-      const article = cell.querySelector(ARTICLE_MATCHER);
-      if (!article) { cell.classList.add('gx-hidden'); hidden++; continue; }
-      const text = (cell.textContent || '').toLowerCase();
+    for (const a of articles()) {
+      markArticle(a);
+      const text = (a.innerText || a.textContent || '').toLowerCase();
       const kw = termHides(text, settings.filterKeywords);
       const hf = termHides(text, settings.filterHandles);
       const catHide =
-        (settings.hidePromoted && cell.classList.contains('gx-ad')) ||
-        (settings.hideRetweets && cell.classList.contains('gx-rt')) ||
-        (settings.hideVerified && cell.classList.contains('gx-verified'));
+        (settings.hidePromoted && isSponsor(a)) ||
+        (settings.hideRetweets && isRetweeted(a)) ||
+        (settings.hideVerified && isVerified(a));
       const hide = kw || hf || catHide;
-      cell.classList.toggle('gx-hidden', hide);
+      a.classList.toggle('gx-hidden', hide);
       if (hide) hidden++;
     }
     stats.postsFiltered = hidden;
-    stats.postsRendered = getCells().length;
-  }
-  const runFilters = updateFilters; // alias used by filter controls
-
-  /* ------------------------------------------------------------------ *
-   * Apply settings to DOM
-   * ------------------------------------------------------------------ */
-  function applyDom() {
-    if (!root) return;
-
-    const cols = clampInt(settings.columnCount, 1, 8);
-    stats.columnCount = cols;
-    root.style.gridTemplateColumns = 'repeat(' + cols + ', minmax(0, 1fr))';
-
-    const density = ['compact', 'cozy', 'roomy'].includes(settings.density) ? settings.density : 'compact';
-    root.classList.remove('gx-d-compact', 'gx-d-cozy', 'gx-d-roomy');
-    root.classList.add('gx-d-' + density);
-
-    const fs = clampNum(settings.fontScale, 0.8, 1.4);
-    root.style.setProperty('--gx-font-scale', fs.toFixed(2));
-
-    root.classList.toggle('gx-hide-avatar', settings.showAvatars === false);
-    root.classList.toggle('gx-hide-media', settings.showMedia === false);
-    root.classList.toggle('gx-hide-metrics', settings.showMetrics === false);
-    root.classList.toggle('gx-hide-promoted', !!settings.hidePromoted);
-    root.classList.toggle('gx-hide-rt', !!settings.hideRetweets);
-    root.classList.toggle('gx-hide-verified', !!settings.hideVerified);
-    root.classList.toggle('gx-bleed', !!settings.bleed);
-    root.classList.toggle('gx-scan', !!settings.scanMode);
-    root.classList.toggle('gx-paused', paused);
-
-    // Persist scan class at <html> level (smoke-test contract + CSS guard).
-    document.documentElement.classList.toggle(CLASS_SCAN, !!settings.scanMode);
-
-    injectExtraCss();
-    updateFilters();
+    stats.postsRendered = articles().length;
     updateStatsReadout();
   }
 
-  function injectExtraCss() {
-    if (!extraCssEl || !extraCssEl.isConnected) {
-      extraCssEl = document.getElementById('gridx-extra-css');
-      if (!extraCssEl) {
-        extraCssEl = document.createElement('style');
-        extraCssEl.id = 'gridx-extra-css';
-        document.head.appendChild(extraCssEl);
-      }
-    }
-    extraCssEl.textContent = settings.extraCss || '';
+  /* ------------------------------------------------------------------ *
+   * Observer: react to X appending/removing articles without moving them.
+   * We only re-tag + re-filter. X's own virtualization does the rest.
+   * ------------------------------------------------------------------ */
+  function wireObserver() {
+    if (!host) return;
+    if (observer) observer.disconnect();
+    observer = new MutationObserver(() => {
+      if (paused) return;
+      // The stream container can be replaced by X; re-resolve if it moved.
+      const now = findHost();
+      if (now && now !== host) { detachObserver(); host = now; savedStyles = null; ensureOverlay(); applyGrid(); wireObserver(); }
+      recomputeFilters();
+    });
+    observer.observe(host, { childList: true, subtree: true });
   }
+  function detachObserver() { if (observer) { observer.disconnect(); observer = null; } }
 
   /* ------------------------------------------------------------------ *
-   * Messaging (chrome.runtime + DOM custom events for the smoke test)
+   * Click-to-open: user asked clicks on a post open the REAL post in a new
+   * tab. We only act when the click is not on a native link/interactive
+   * control, and we open via a real <a> so it is a genuine user gesture.
    * ------------------------------------------------------------------ */
-  function applyMessage(detail) {
-    if (!detail || typeof detail !== 'object') return;
-    let touched = false;
-
-    if ('scanMode' in detail) {
-      touched = true;
-      if (detail.scanMode && !settings.scanMode) {
-        prevSettings = pick(settings, SCAN_KEYS);
-        Object.assign(settings, SCAN_OVERRIDES);
-        settings.scanMode = true;
-        document.documentElement.classList.add(CLASS_SCAN);
-      } else if (!detail.scanMode && settings.scanMode) {
-        const p = prevSettings || {};
-        Object.assign(settings, p);
-        settings.scanMode = false;
-        document.documentElement.classList.remove(CLASS_SCAN);
-        prevSettings = null;
-      } else {
-        settings.scanMode = !!detail.scanMode;
-      }
-      // fallthrough may apply non-scan fields too
-    }
-    for (const k of Object.keys(detail)) {
-      if (k === 'scanMode') continue;
-      settings[k] = detail[k];
-      touched = true;
-    }
-    if (root && touched) { applyDom(); }
-    // Even if the grid isn't active yet, persist so activation uses the values.
-    saveSettings();
+  function onClick(e) {
+    if (paused) return;
+    if (e.defaultPrevented) return;
+    // Let X handle links, buttons, media controls, inputs natively.
+    const interactive = e.target.closest(
+      'a, [role="link"], [role="button"], button, [tabindex], input, textarea, video, audio, img, select'
+    );
+    if (interactive) return;
+    const art = e.target.closest(ARTICLE);
+    if (!art) return;
+    const url = art.dataset.gxUrl || (() => {
+      const l = art.querySelector(STATUS_LINK); return l ? l.href : '';
+    })();
+    if (!url) return;
+    e.preventDefault();
+    openTab(url);
   }
 
-  function handleCommand(cmd) {
-    if (cmd === 'toggle-grid') {
-      if (active) deactivate(); else activate();
-    } else if (cmd === 'toggle-pause') {
-      togglePause();
-    } else if (cmd === 'toggle-scan') {
-      toggleScan();
-    }
-  }
-
-  function registerMessaging() {
-    // Real chrome messaging (popup / options / background).
-    try {
-      chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-        if (!msg || typeof msg !== 'object') return;
-        if (msg.type === 'gridx:update') { applyMessage(msg.settings || {}); sendResponse({ ok: true }); }
-        else if (msg.type === 'gridx:command') { handleCommand(msg.payload); sendResponse({ ok: true }); }
-        else if (msg.type === 'gridx:getState') { sendResponse(getState()); }
-        return true; // allow async sendResponse if needed
-      });
-    } catch (e) { log('chrome messaging unavailable', e); }
-
-    // DOM custom events so page scripts (and the Playwright smoke test) can
-    // drive the extension in the shared DOM without needing the extension id.
-    document.addEventListener('gridx:update', (e) => {
-      applyMessage(e.detail || {});
-    });
-    document.addEventListener('gridx:command', (e) => {
-      handleCommand(e.detail);
-    });
-    document.addEventListener('gridx:getState', (e) => {
-      document.dispatchEvent(new CustomEvent('gridx:state', { detail: getState() }));
-    });
+  function openTab(url) {
+    // One method, one tab. window.open(..., 'noopener') returns null by design
+    // (no cross-origin ref) which would wrongly look like a "failure" and cause
+    // a double-open if we also fired an anchor. Using a real <a>.click() in a
+    // user-gesture is reliable; the deferred removal lets navigation start
+    // (an immediate remove() can cancel it).
+    const a = document.createElement('a');
+    a.href = url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    a.style.setProperty('display', 'none');
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { try { a.remove(); } catch (e) {} }, 100);
   }
 
   /* ------------------------------------------------------------------ *
    * Activation / teardown
    * ------------------------------------------------------------------ */
+  let retryTimer = null;
   function activate() {
     if (active) return;
-    ensureDom();
+    ensureOverlay();
     hideFatal();
-    const pc = findPrimary();
-    if (!pc) {
-      // Fail-safe: do not touch the page. Keep retrying in case X hydrates late.
-      showFatal('GridX: detected a page but no primary timeline yet. Retrying…');
+    host = findHost();
+    if (!host) {
+      showFatal('GridX: no timeline container found yet. Retrying…');
       scheduleRetry();
       return;
     }
     active = true;
     document.documentElement.classList.add(CLASS_ACTIVE);
-    applyDom();
-    hoistAll(pc);
-    wireObserver(pc);
+    savedStyles = {};
+    applyGrid();
+    recomputeFilters();
+    document.addEventListener('click', onClick, true);
+    document.addEventListener('keydown', onKeydown, true);
     startStats();
     setStatus('GridX active');
-    log('activated');
+    log('activated on', host);
   }
 
-  let retryTimer = null;
+  function wireToHost() {
+    // (retained as a no-op for call-site clarity; handlers are document-level)
+  }
+
   function scheduleRetry() {
     if (retryTimer) return;
     let tries = 0;
     retryTimer = setInterval(() => {
       tries++;
-      if (findPrimary()) {
-        clearInterval(retryTimer);
-        retryTimer = null;
-        if (!active) activate();
-        return;
-      }
-      if (tries > 10) {
-        clearInterval(retryTimer);
-        retryTimer = null;
-        if (root && !active) showFatal('GridX: could not find the timeline after several attempts.');
-      }
+      if (findHost()) { clearInterval(retryTimer); retryTimer = null; if (!active) activate(); return; }
+      if (tries > 10) { clearInterval(retryTimer); retryTimer = null; if (root && !active) showFatal('GridX: could not find the timeline after several attempts.'); }
     }, 1500);
   }
 
   function deactivate() {
     if (!active) return;
+    detachObserver();
     stopStats();
-    if (observer) { observer.disconnect(); observer = null; }
-    primaryEl = null;
-    revertToPage();
-    if (root) { root.remove(); root = null; }
+    restoreHost();
+    document.removeEventListener('click', onClick, true);
+    document.removeEventListener('keydown', onKeydown, true);
     document.documentElement.classList.remove(CLASS_ACTIVE, CLASS_SCAN);
+    replantAll();
     active = false;
-    cursorCell = null;
+    cursorArticle = null;
     if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
     log('deactivated');
   }
 
-  // Put X's articles back where X wants them, then drop the grid.
-  function revertToPage() {
-    const pc = findPrimary();
-    if (!root) return;
-    const seen = new Set();
-    if (pc) collectArticles(pc).forEach((a) => seen.add(a));
-    const putBack = (a) => { if (a && !seen.has(a)) { seen.add(a); if (pc) pc.appendChild(a); } };
-    for (const cell of Array.from(root.querySelectorAll('.gx-cell'))) {
-      const a = cell.querySelector(ARTICLE_MATCHER);
-      putBack(a);
-      cell.remove();
-    }
-    collectArticles(stashEl).forEach(putBack);
+  // On toggle-off we leave X's DOM exactly as-is (we never changed it beyond
+  // classes/inline styles already restored). Nothing to move back.
+  function replantAll() { /* no-op in re-flow architecture: X is untouched */ }
+
+  function showFatal(msg) {
+    if (!fatalEl) return;
+    const ps = fatalEl.querySelectorAll('p');
+    if (msg && ps[1]) ps[1].textContent = msg;
+    fatalEl.hidden = false;
   }
+  function hideFatal() { if (fatalEl) fatalEl.hidden = true; }
 
   /* ------------------------------------------------------------------ *
    * Stats + status
@@ -743,18 +501,14 @@
   }
   function stopStats() {
     if (statTimer) { clearInterval(statTimer); statTimer = null; }
-    updateStatsReadout();
-    persistCounters();
+    updateStatsReadout(); persistCounters();
   }
-
   function fmtTime(ms) {
-    const s = Math.floor(ms / 1000);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    return (h ? h + 'h ' : '') + (m ? m + 'm ' : '') + sec + 's';
+    let s = Math.floor(ms / 1000);
+    const h = Math.floor(s / 3600); s -= h * 3600;
+    const m = Math.floor(s / 60); s -= m * 60;
+    return (h ? h + 'h ' : '') + (m ? m + 'm ' : '') + s + 's';
   }
-
   function updateStatsReadout() {
     if (!statsEl) return;
     statsEl.textContent =
@@ -765,168 +519,180 @@
       (paused ? ' · paused' : '') +
       (settings.scanMode ? ' · scan' : '');
   }
-
-  function setStatus(text, ms = 2000) {
+  function setStatus(text, ms = 2500) {
     if (!hintsEl) return;
     hintsEl.textContent = text;
     if (lastStatusTimer) clearTimeout(lastStatusTimer);
-    if (ms > 0) {
-      lastStatusTimer = setTimeout(() => { if (hintsEl) hintsEl.textContent = ''; }, ms);
-    }
-  }
-
-  function getState() {
-    updateFilters();
-    updateStatsReadout();
-    return {
-      active,
-      paused,
-      scanMode: settings.scanMode,
-      columnCount: settings.columnCount,
-      density: settings.density,
-      fontScale: settings.fontScale,
-      postsRendered: stats.postsRendered,
-      postsFiltered: stats.postsFiltered,
-      gridActiveMs: stats.gridActiveMs,
-      hidePromoted: settings.hidePromoted,
-      hideRetweets: settings.hideRetweets,
-    };
+    if (ms > 0) lastStatusTimer = setTimeout(() => { if (hintsEl) hintsEl.textContent = ''; }, ms);
   }
 
   /* ------------------------------------------------------------------ *
-   * Scan / pause toggles
+   * Filters (typeahead) controls
    * ------------------------------------------------------------------ */
-  function toggleScan() {
-    applyMessage({ scanMode: !settings.scanMode });
-    setStatus(settings.scanMode ? 'scan mode ON' : 'scan mode OFF');
+  function previewTerms() {
+    return (filterInput ? filterInput.value : '').split(/[\s,]+/).filter(Boolean);
   }
+  function setKeywordFilter(terms, preview) {
+    settings.filterKeywords = terms;
+    const tag = root ? root.querySelector('.gx-fb-tag') : null;
+    if (tag) tag.textContent = terms.length ? 'filter(' + terms.length + '):' : 'filter:';
+    recomputeFilters();
+    saveSettings();
+    log('filter', terms, preview ? '(preview)' : '(applied)');
+  }
+  function clearFilter(msg) {
+    if (filterInput) filterInput.value = '';
+    settings.filterKeywords = [];
+    setKeywordFilter([], false);
+    if (msg) setStatus(msg);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * CSS var + scan classes applied to <html>
+   * ------------------------------------------------------------------ */
+  function applyScanClass() {
+    document.documentElement.classList.toggle(CLASS_SCAN, !!settings.scanMode);
+    // extra CSS injection
+    try { ensureExtraCssEl().textContent = settings.extraCss || ''; } catch (e) {}
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Messaging (chrome.runtime + DOM custom events)
+   * ------------------------------------------------------------------ */
+  function applyMessage(detail) {
+    if (!detail || typeof detail !== 'object') return;
+    if ('scanMode' in detail) {
+      if (detail.scanMode && !settings.scanMode) {
+        prevSettings = pick(settings, SCAN_KEYS);
+        Object.assign(settings, SCAN_OVERRIDES);
+        settings.scanMode = true;
+      } else if (!detail.scanMode && settings.scanMode) {
+        const p = prevSettings || {};
+        Object.assign(settings, p);
+        settings.scanMode = false;
+        prevSettings = null;
+      } else settings.scanMode = !!detail.scanMode;
+    }
+    for (const k of Object.keys(detail)) if (k !== 'scanMode') settings[k] = detail[k];
+    if (active) { applyGrid(); recomputeFilters(); }
+    saveSettings();
+  }
+
+  function handleCommand(cmd) {
+    if (cmd === 'toggle-grid') { if (active) deactivate(); else activate(); }
+    else if (cmd === 'toggle-pause') togglePause();
+    else if (cmd === 'toggle-scan') toggleScan();
+  }
+
+  function registerMessaging() {
+    try {
+      chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
+        if (!msg || typeof msg !== 'object') return;
+        if (msg.type === 'gridx:update') { applyMessage(msg.settings || {}); sendResponse({ ok: true }); }
+        else if (msg.type === 'gridx:command') { handleCommand(msg.payload); sendResponse({ ok: true }); }
+        else if (msg.type === 'gridx:getState') { sendResponse(getState()); }
+        return true;
+      });
+    } catch (e) { log('chrome messaging unavailable', e); }
+    document.addEventListener('gridx:update', (e) => applyMessage(e.detail || {}));
+    document.addEventListener('gridx:command', (e) => handleCommand(e.detail));
+    document.addEventListener('gridx:getState', (e) => {
+      document.dispatchEvent(new CustomEvent('gridx:state', { detail: getState() }));
+    });
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Scan / pause
+   * ------------------------------------------------------------------ */
+  function toggleScan() { applyMessage({ scanMode: !settings.scanMode }); setStatus(settings.scanMode ? 'scan ON' : 'scan OFF'); }
   function togglePause() {
     paused = !paused;
-    if (root) {
-      root.classList.toggle('gx-paused', paused);
-      const pc = findPrimary();
-      if (paused) { if (observer) observer.disconnect(); }
-      else if (pc) wireObserver(pc);
-    }
+    document.documentElement.classList.toggle('gx-paused', paused);
+    const h = host;
+    if (paused) { h && h.classList.add('gx-paused'); detachObserver(); }
+    else { h && h.classList.remove('gx-paused'); wireObserver(); }
     setStatus(paused ? 'paused' : 'resumed');
     updateStatsReadout();
   }
 
   /* ------------------------------------------------------------------ *
-   * Keyboard navigation (vim-flavored, in the content script so any key can
-   * bind - independent of the `commands` API which is limited to a set.)
+   * Keyboard navigation (vim-flavored; in content script so any key binds)
    * ------------------------------------------------------------------ */
-  function currentCells() {
-    return root ? Array.from(root.querySelectorAll('.gx-cell:not(.gx-hidden)')) : [];
+  const isEditable = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+
+  function list() {
+    return (host ? Array.from(host.querySelectorAll(ARTICLE)) : []).filter(a => !a.classList.contains('gx-hidden'));
   }
-  function cellIndex(cell) {
-    return currentCells().indexOf(cell);
+  function idx(a) { return list().indexOf(a); }
+  function focus(a) {
+    if (!a) return;
+    if (cursorArticle) cursorArticle.classList.remove('gx-cursor');
+    cursorArticle = a; a.classList.add('gx-cursor');
+    a.scrollIntoView({ block: 'nearest' });
   }
-  function focusCell(cell) {
-    if (!cell) return;
-    if (cursorCell) cursorCell.classList.remove('gx-cursor');
-    cursorCell = cell;
-    cell.classList.add('gx-cursor');
-    cell.scrollIntoView({ block: 'nearest' });
+  function move(delta) {
+    const l = list(); if (!l.length) return;
+    const i = idx(cursorArticle);
+    focus(l[i < 0 ? 0 : Math.max(0, Math.min(l.length - 1, i + delta))]);
   }
-  function moveCursor(delta) {
-    const list = currentCells();
-    if (!list.length) return;
-    const i = cellIndex(cursorCell);
-    const next = i < 0 ? 0 : Math.max(0, Math.min(list.length - 1, i + delta));
-    focusCell(list[next]);
-  }
-  function moveColumn(delta) {
-    const list = currentCells();
-    if (!list.length) return;
-    const i = cellIndex(cursorCell);
-    if (i < 0) { focusCell(list[0]); return; }
-    const cols = clampInt(settings.columnCount, 1, 8);
-    const row = Math.floor(i / cols);
-    const col = i % cols;
-    const targetCol = col + delta;
-    if (targetCol < 0 || targetCol >= cols) return;
-    const targetRow = list.filter((c, idx) => Math.floor(idx / cols) === row);
-    const inRow = list[Math.min(i + delta, list.length - 1)];
-    // Prefer the exact (row, col) slot; fall back to nearest.
-    const slot = row * cols + targetCol;
-    const cell = slot < list.length && Math.floor(slot / cols) === row ? list[slot] : inRow;
-    focusCell(cell);
-  }
-  function scrollByPage(f) {
-    if (!root) return;
-    root.scrollTop += f * root.clientHeight;
-  }
+  function scrollBy(f) { if (host) host.scrollTop += f * (host.clientHeight || 900); }
   function openCursor(sameTab) {
-    const cell = cursorCell;
-    const url = cell ? (cell.dataset.gxUrl || '') : '';
+    const a = cursorArticle;
+    const url = a ? (a.dataset.gxUrl || '') : '';
     if (!url) { setStatus('no post under cursor'); return; }
-    if (sameTab) {
-      window.location.href = url;
-    } else {
-      // Real <a> click = user gesture + normal new-tab behavior.
-      const a = document.createElement('a');
-      a.href = url;
-      a.target = '_blank';
-      a.rel = 'noopener noreferrer';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-    }
+    if (sameTab) window.location.href = url; else openTab(url);
   }
-  function goBack() { window.history.back(); }
-  function toggleExpand(cell) {
-    if (!cell) return;
-    cell.classList.toggle('gx-expanded');
-  }
-  function toggleMedia(cell) {
-    if (!cell) return;
-    cell.classList.toggle('gx-media-open');
-  }
-  function focusFilter() {
-    if (filterInput) { filterInput.focus(); filterInput.select(); }
-  }
-  function toggleKeymap() {
-    if (keymapEl) keymapEl.hidden = !keymapEl.hidden;
-  }
+  function toggleCursor() { if (cursorArticle) cursorArticle.classList.toggle('gx-expanded'); }
+  function toggleKeymap() { if (keymapEl) keymapEl.hidden = !keymapEl.hidden; }
   function clearCursorOrClose() {
     if (keymapEl && !keymapEl.hidden) { keymapEl.hidden = true; return; }
-    if (cursorCell) { cursorCell.classList.remove('gx-cursor'); cursorCell = null; setStatus('cursor cleared'); }
+    if (cursorArticle) { cursorArticle.classList.remove('gx-cursor'); cursorArticle = null; setStatus('cursor cleared'); }
   }
 
   function onKeydown(e) {
     if (e.defaultPrevented) return;
     const t = e.target;
-    if (isEditableTarget(t)) {
-      // Allow Esc to clear the filter while typing in it.
+    if (isEditable(t)) {
       if (t === filterInput && e.key === 'Escape') { e.preventDefault(); clearFilter('cleared filter'); }
       return;
     }
     const shift = e.shiftKey;
     let handled = true;
     switch (e.key) {
-      case 'j': case 'ArrowDown': moveCursor(1); break;
-      case 'k': case 'ArrowUp': moveCursor(-1); break;
-      case 'h': case 'ArrowLeft': moveColumn(-1); break;
-      case 'l': case 'ArrowRight': moveColumn(1); break;
-      case 'g': moveCursor(-10000000); break;
-      case 'G': moveCursor(10000000); break;
-      case 'd': scrollByPage(0.5); break;
-      case 'u': scrollByPage(shift ? -1 : -0.5); break;
-      case ' ': e.preventDefault(); scrollByPage(shift ? -1 : 1); break;
+      case 'j': case 'ArrowDown': move(1); break;
+      case 'k': case 'ArrowUp': move(-1); break;
+      case 'g': move(-10000000); break;
+      case 'G': move(10000000); break;
+      case 'd': scrollBy(0.5); break;
+      case 'u': scrollBy(shift ? -1 : -0.5); break;
+      case ' ': e.preventDefault(); scrollBy(shift ? -1 : 1); break;
       case 'Enter': openCursor(false); break;
       case 'o': openCursor(true); break;
-      case 'Backspace': goBack(); break;
-      case 'x': toggleExpand(cursorCell); break;
-      case 'm': toggleMedia(cursorCell); break;
-      case 'f': focusFilter(); break;
+      case 'Backspace': window.history.back(); break;
+      case 'x': toggleCursor(); break;
+      case 'f': if (filterInput) { filterInput.focus(); filterInput.select(); } break;
       case 's': toggleScan(); break;
       case 'p': togglePause(); break;
       case '?': toggleKeymap(); break;
       case 'Escape': clearCursorOrClose(); break;
       default: handled = false;
     }
-    if (handled) e.preventDefault();
+    if (handled) { e.preventDefault(); }
+  }
+
+  /* ------------------------------------------------------------------ *
+   * State snapshot for popup/options
+   * ------------------------------------------------------------------ */
+  function getState() {
+    recomputeFilters();
+    return {
+      active, paused, scanMode: settings.scanMode,
+      columnCount: settings.columnCount, density: settings.density,
+      fontScale: settings.fontScale,
+      postsRendered: stats.postsRendered, postsFiltered: stats.postsFiltered,
+      gridActiveMs: stats.gridActiveMs,
+      hidePromoted: settings.hidePromoted, hideRetweets: settings.hideRetweets,
+    };
   }
 
   /* ------------------------------------------------------------------ *
@@ -936,15 +702,8 @@
     await loadCounters();
     await loadSettings();
     registerMessaging();
-    document.addEventListener('keydown', onKeydown, true);
-    // Activate as soon as the timeline exists; retry a few times for slow loads.
     activate();
   }
-
-  // `document_idle` guarantees body exists, but be safe on early weird pages.
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
-  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
+  else init();
 })();

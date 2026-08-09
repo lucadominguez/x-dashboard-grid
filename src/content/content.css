@@ -1,522 +1,241 @@
 /* ============================================================================
-   GridX content styles
-   ----------------------------------------------------------------------------
-   Scoping strategy
-   ----------------
-   Everything meaningful is scoped under `#gridx-root` (our own wrapper), plus a
-   small set of page-level rules gated behind `html.gridx-active`. This keeps the
-   extension completely inert on X when the grid is not active and makes sure our
-   styles (and our wrapper classes) never rely on X's class names, which change
-   frequently. Where X's own styles would otherwise override us we use
-   `!important`, because the grid is an intentional takeover of the viewport.
+ * GridX content styles — "CSS re-flow" architecture
+ * ----------------------------------------------------------------------------
+ * Contrast with v0.1 (hoisting): we no longer re-parent or hyper-rewrite X's
+ * articles. Instead we find X's own timeline container and columnize it in
+ * place with a CSS grid (columns are applied inline by JS on .gx-stream).
+ * Because X keeps ownership of layout, clicks, scroll and pagination, articles
+ * keep their native rendering — which is exactly what fixes the icon-overlap
+ * and the rate-limit fetch-storm seen in the hoisting build.
+ *
+ * Everything meaningful is gated behind `html.gridx-active` (or scoped to our
+ * own chrome in #gridx-root), so GridX is inert when off and switching it off
+ * leaves X exactly as it was (the only DOM changes are classes + host inline
+ * styles, both reverted on deactivate).
+ *
+ * We are selective about `!important`: only where we must defeat X's own rules
+ * (chrome hiding, grid criticals). We do NOT try to micro-restyle article
+ * internals — that was the source of overlap.
+ * ========================================================================== */
 
-   Dark mode: we read the user's OS preference. X's own theme is irrelevant
-   because we cover the viewport with our own surface.
-   ========================================================================== */
-
-/* --- Page-level guard: stop background scrolling while the grid owns the tab - */
+/* --- Page-level: kill body scroll while the grid owns the tab. ----------- */
 html.gridx-active,
 html.gridx-active body {
-  overflow: hidden !important;
   scroll-behavior: auto !important;
+  overflow: hidden !important;
 }
 
-/* ============================================================================
-   #gridx-root : the grid container = the scroll container = the viewport
-   ----------------------------------------------------------------------------
-   Fixed, full-viewport. display:grid so cells lay out in columns while the
-   thin chrome bars (filter/status/keymap/stash) span all rows `1 / -1`.
-   ========================================================================== */
+/* --- Hide X chrome / widen the feed (layered, best-effort selectors). ---- */
+html.gridx-active header[role="banner"],
+html.gridx-active nav[aria-label="Primary"],
+html.gridx-active [data-testid="sidebarColumn"],
+html.gridx-active [aria-label="Primary"] nav { display: none !important; }
+html.gridx-active main[role="main"],
+html.gridx-active [data-testid="primaryColumn"] {
+  width: 100% !important;
+  max-width: none !important;
+  margin: 0 auto !important;
+}
+
+/* --- Density/font/brand vars cascading from <html> into the feed. ------- */
+html.gridx-active {
+  --gx-font-scale: 1;
+  --gx-density: 1;
+  --gx-accent: #1d9bf0;
+}
+@media (prefers-color-scheme: dark) {
+  html.gridx-active { --gx-accent: #1d9bf0; }
+}
+
+/* ===========================================================================
+ * The feed container X already owns. Grid columns are applied inline by JS;
+ * these rules only cover vars/gaps/guards that apply regardless.
+ * ========================================================================== */
+.gx-stream { box-sizing: border-box; }
+
+/* Never let a tweet contribute horizontal overflow inside its column. */
+.gx-stream,
+.gx-stream [data-testid="cellInnerDiv"],
+.gx-stream article {
+  min-width: 0 !important;
+  max-width: 100%;
+}
+/* Gentle density + font-scale of tweet text only (a hint, not a rewrite). */
+.gx-stream article,
+.gx-stream [data-testid="cellInnerDiv"] {
+  font-size: calc(14px * var(--gx-font-scale) * (1 - 0.08 * var(--gx-density)));
+}
+
+/* --- Filter / cursor / paused moon --------------------------------------- */
+.gx-hidden { display: none !important; }
+.gx-cursor {
+  outline: 2px solid var(--gx-accent) !important;
+  outline-offset: -2px;
+}
+html.gridx-active.gx-paused .gx-stream { filter: grayscale(0.5) opacity(0.75); }
+
+/* --- Feature toggles: show/hide by X's own data-testids (best-effort). If
+   X renames any of these we simply stop hiding that thing — never a crash. */
+html.gridx-active.gx-hide-avatar .gx-stream [data-testid="UserAvatar-Container"],
+html.gridx-active.gx-hide-avatar .gx-stream [data-testid="Tweet-User-Avatar"],
+html.gridx-scan .gx-stream [data-testid="UserAvatar-Container"] { display: none !important; }
+
+html.gridx-active.gx-hide-media .gx-stream [data-testid="tweetPhoto"],
+html.gridx-active.gx-hide-media .gx-stream [data-testid="videoPlayer"],
+html.gridx-scan .gx-stream [data-testid="tweetPhoto"],
+html.gridx-scan .gx-stream [data-testid="videoPlayer"] { display: none !important; }
+
+html.gridx-active.gx-hide-metrics .gx-stream [role="group"],
+html.gridx-scan .gx-stream [role="group"] { display: none !important; }
+
+/* --- Kill X animation on the grid path (fast scanning). ------------------ */
+html.gridx-active .gx-stream,
+html.gridx-active .gx-stream *,
+#gridx-root,
+#gridx-root * { animation: none !important; transition: none !important; }
+
+/* ===========================================================================
+ * GridX overlay chrome (#gridx-root).
+ * Deliberately NON-interactive at the root (pointer-events:none) so it never
+ * blocks X content; individual widgets re-enable pointer events.
+ * ========================================================================== */
 #gridx-root {
   --gx-bg: #ffffff;
-  --gx-cell-bg: #ffffff;
-  --gx-cell-border: #e6e8eb;
-  --gx-text: #0f1419;
+  --gx-fg: #0f1419;
   --gx-muted: #536471;
-  --gx-muted-soft: #8b98a5;
-  --gx-accent: #1d9bf0;
-  --gx-chip-bg: #eef3f8;
   --gx-border: #e6e8eb;
-  --gx-shadow: 0 1px 3px rgba(0, 0, 0, 0.06);
-
-  --gx-font-base: 13px;
-  --gx-font-scale: 1;
-
+  --gx-chip: #eef3f8;
+  --gx-accent: #1d9bf0;
   position: fixed;
   inset: 0;
   z-index: 2147483000;
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  grid-auto-rows: min-content;
-  align-content: start;
-  gap: 6px;
-  padding: 8px;
-  box-sizing: border-box;
-  overflow-y: auto;
-  overflow-x: hidden;
-  overscroll-behavior: contain;
-  scroll-behavior: auto !important;
-  background: var(--gx-bg);
-  color: var(--gx-text);
+  pointer-events: none;
+  color: var(--gx-fg);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica,
     Arial, sans-serif;
-  font-size: var(--gx-font-base);
-  line-height: 1.25;
-  -webkit-font-smoothing: antialiased;
-  text-rendering: optimizeLegibility;
+  font-size: 13px;
+  line-height: 1.3;
 }
-
 @media (prefers-color-scheme: dark) {
   #gridx-root {
     --gx-bg: #11151a;
-    --gx-cell-bg: #1a2027;
-    --gx-cell-border: #2a323c;
-    --gx-text: #e7e9ea;
+    --gx-fg: #e7e9ea;
     --gx-muted: #8b98a5;
-    --gx-muted-soft: #5c6b78;
-    --gx-chip-bg: #232b34;
     --gx-border: #2a323c;
-    --gx-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+    --gx-chip: #1c232b;
   }
 }
 
-/* Bleed mode: kill the gutter so cells run edge to edge. */
-#gridx-root.gx-bleed {
-  padding: 0;
-  gap: 0;
-}
-
-/* Paused: visually dim + disable interactions but keep everything in place. */
-#gridx-root.gx-paused {
-  opacity: 0.55;
-  pointer-events: none;
-}
-#gridx-root.gx-paused #gridx-fatal {
-  pointer-events: auto;
-}
-
-/* ----------------------------------------------------------------------------
-   Chrome bars that sit inside the grid (span the full width)
-   -------------------------------------------------------------------------- */
-#gridx-filterbar,
-#gridx-statusbar,
-#gridx-keymap,
-#gridx-fatal,
-#gridx-stash {
-  grid-column: 1 / -1;
-  box-sizing: border-box;
-}
-
-/* --- Filter (typeahead) bar at the top ------------------------------------ */
+/* --- Filter bar: fixed chip, top-center, draggable-ish --------------------------------- */
 #gridx-filterbar {
-  position: sticky;
-  top: 0;
-  z-index: 20;
+  pointer-events: auto;
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 6px;
+  width: min(460px, 92vw);
+  padding: 5px 8px;
   border: 1px solid var(--gx-border);
-  border-radius: 6px;
-  background: var(--gx-cell-bg);
-  box-shadow: var(--gx-shadow);
-}
-#gridx-filterbar input {
-  flex: 1;
-  min-width: 0;
-  padding: 4px 8px;
-  font-size: 12px;
-  color: var(--gx-text);
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: 4px;
-  outline: none;
-}
-#gridx-filterbar input:focus {
-  border-color: var(--gx-accent);
+  border-radius: 999px;
+  background: var(--gx-bg);
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.15);
 }
 #gridx-filterbar .gx-fb-tag {
   color: var(--gx-muted);
   font-size: 11px;
-}
-
-/* --- Status bar at the bottom (transient hints + stats) ------------------- */
-#gridx-statusbar {
-  position: sticky;
-  bottom: 0;
-  z-index: 20;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 4px 8px;
-  font-size: 11px;
-  color: var(--gx-muted);
-  background: var(--gx-cell-bg);
-  border: 1px solid var(--gx-border);
-  border-radius: 6px;
-  box-shadow: var(--gx-shadow);
-}
-#gridx-statusbar .gx-hints {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-#gridx-statusbar .gx-stats {
   white-space: nowrap;
 }
-#gridx-statusbar b,
-#gridx-statusbar .gx-kbd {
-  color: var(--gx-text);
-  font-weight: 600;
+#gridx-filterbar input {
+  flex: 1;
+  min-width: 0;
+  padding: 3px 6px;
+  font-size: 12px;
+  color: var(--gx-fg);
+  background: transparent;
+  border: 0;
+  outline: none;
 }
-#gridx-statusbar .gx-kbd {
-  display: inline-block;
-  padding: 0 3px;
-  border: 1px solid var(--gx-border);
-  border-radius: 3px;
-  background: var(--gx-chip-bg);
-  font-size: 10px;
-  font-family: inherit;
-}
+#gridx-filterbar input:focus { outline: none; }
 
-/* --- Keymap overlay -------------------------------------------------------- */
+/* --- Status bar: bottom, passive (no pointer events needed). ------------ */
+#gridx-statusbar {
+  position: fixed;
+  bottom: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 5;
+  display: flex;
+  gap: 20px;
+  width: max-content;
+  max-width: 96vw;
+  padding: 4px 12px;
+  font-size: 11px;
+  color: var(--gx-muted);
+  background: var(--gx-bg);
+  border: 1px solid var(--gx-border);
+  border-radius: 999px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.12);
+}
+#gridx-statusbar .gx-hints { min-width: 120px; }
+#gridx-statusbar .gx-stats { white-space: nowrap; }
+
+/* --- Keymap overlay ------------------------------------------------------- */
 #gridx-keymap {
+  pointer-events: auto;
   position: fixed;
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
   z-index: 50;
-  width: min(560px, 92vw);
-  max-height: 70vh;
+  width: min(520px, 94vw);
+  max-height: 76vh;
   overflow-y: auto;
-  padding: 14px 16px;
+  padding: 14px 18px;
   border: 1px solid var(--gx-border);
-  border-radius: 10px;
-  background: var(--gx-cell-bg);
+  border-radius: 12px;
+  background: var(--gx-bg);
   box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
-  color: var(--gx-text);
-  text-align: left;
 }
-#gridx-keymap h2 {
-  margin: 0 0 8px;
-  font-size: 14px;
-}
-#gridx-keymap table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 12px;
-}
-#gridx-keymap td {
-  padding: 3px 6px;
-  border-bottom: 1px solid var(--gx-border);
-}
+#gridx-keymap h2 { margin: 0 0 10px; font-size: 14px; }
+#gridx-keymap table { width: 100%; border-collapse: collapse; font-size: 12px; }
+#gridx-keymap td { padding: 3px 6px; border-bottom: 1px solid var(--gx-border); }
 #gridx-keymap td:first-child {
   color: var(--gx-accent);
   font-weight: 600;
   white-space: nowrap;
   font-family: ui-monospace, Menlo, Consolas, monospace;
 }
+#gridx-keymap .gx-km-note { color: var(--gx-muted); font-size: 11px; margin-top: 8px; }
 
-/* --- Fatal / "timeline not found" overlay --------------------------------- */
+/* --- Fatal / "timeline not found" banner ---------------------------------- */
 #gridx-fatal {
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
+  pointer-events: auto;
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
   z-index: 100;
-  margin: 12px;
-  padding: 18px 20px;
-  border: 1px solid #f0a;
-  border-radius: 10px;
-  background: var(--gx-cell-bg);
-  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
-  text-align: left;
+  width: min(420px, 94vw);
+  padding: 16px 18px;
+  border: 1px solid #f91880;
+  border-radius: 12px;
+  background: var(--gx-bg);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.25);
 }
-#gridx-fatal h1 {
-  margin: 0 0 8px;
-  font-size: 15px;
-}
-#gridx-fatal p {
-  margin: 4px 0;
-  font-size: 12px;
-  color: var(--gx-muted);
-}
+#gridx-fatal h1 { margin: 0 0 6px; font-size: 15px; }
+#gridx-fatal p { margin: 4px 0; font-size: 12px; color: var(--gx-muted); }
 #gridx-fatal button {
-  margin-top: 10px;
-  padding: 6px 12px;
+  margin-top: 8px;
+  padding: 6px 14px;
   font-size: 12px;
   font-weight: 600;
   color: #fff;
   background: var(--gx-accent);
   border: 0;
-  border-radius: 6px;
+  border-radius: 999px;
   cursor: pointer;
-}
-
-/* --- Stash ----------------------------------------------------------------
-   Removed articles are parked here, not destroyed. X's own React observer
-   callbacks still hold references to these nodes; destroying them could make X
-   throw. Keeping them alive in a hidden container is safer and lets us
-   re-parent the exact same node back into the grid if X re-inserts it.
-   -------------------------------------------------------------------------- */
-#gridx-stash {
-  position: fixed !important;
-  top: 0 !important;
-  left: -100000px !important;
-  width: 1px !important;
-  height: 1px !important;
-  overflow: hidden !important;
-  visibility: hidden !important;
-  pointer-events: none !important;
-  display: block !important;
-}
-
-/* ============================================================================
-   Cells (.gx-cell)
-   One wrapper per tweet. The original X <article> stays the source of truth;
-   we only re-parent it. The wrapper carries GridX annotation (AD/RT/media) and
-   GridX behaviour (cursor, expand, hide).
-   ========================================================================== */
-.gx-cell {
-  position: relative;
-  box-sizing: border-box;
-  min-width: 0;
-  /* Off-screen cells skip render work during fast scroll. */
-  content-visibility: auto;
-  contain-intrinsic-size: 150px 200px;
-  padding: 6px;
-  border: 1px solid var(--gx-cell-border);
-  border-radius: 8px;
-  background: var(--gx-cell-bg);
-  box-shadow: var(--gx-shadow);
-  overflow: hidden;
-}
-.gx-cell:hover {
-  border-color: var(--gx-accent);
-}
-
-/* Density = multiply internal spacing + font of the cell only. */
-#gridx-root.gx-d-compact {
-  --gx-density: 1;
-  --gx-pad: 6px;
-  --gx-font-mul: 1;
-}
-#gridx-root.gx-d-cozy {
-  --gx-density: 1.35;
-  --gx-pad: 9px;
-  --gx-font-mul: 1.08;
-}
-#gridx-root.gx-d-roomy {
-  --gx-density: 1.75;
-  --gx-pad: 12px;
-  --gx-font-mul: 1.16;
-}
-.gx-cell {
-  padding: var(--gx-pad, 6px);
-}
-.gx-cell *,
-.gx-cell {
-  box-sizing: border-box;
-}
-
-/* Scan mode = absolute maximum info density (applied at the <html> level so
-   the whole page reflects it, matching the smoke-test contract). */
-#gridx-root.gx-scan {
-  --gx-density: 1;
-  --gx-pad: 4px;
-  --gx-font-mul: 0.92;
-  gap: 3px;
-  padding: 3px;
-}
-#gridx-root.gx-scan .gx-cell {
-  border-radius: 5px;
-  padding: var(--gx-pad, 4px);
-}
-
-/* --- Cursor (vim-style movement highlight) -------------------------------- */
-.gx-cell.gx-cursor {
-  border-color: var(--gx-accent) !important;
-  box-shadow: 0 0 0 2px var(--gx-accent) !important;
-}
-
-/* --- Expanded (click the cell body or press `x`) -------------------------- */
-.gx-cell.gx-expanded {
-  grid-column: 1 / -1 !important;
-  z-index: 5;
-}
-
-/* --- Hidden (by filters / category toggles) ------------------------------- */
-.gx-cell.gx-hidden {
-  display: none !important;
-}
-
-/* ---- In-cell internal layout: force quiet, predictable tweet rendering ---- */
-.gx-cell article,
-.gx-cell article[data-testid="tweet"] {
-  display: block !important;
-  width: 100% !important;
-  max-width: none !important;
-  min-width: 0 !important;
-  padding: 0 !important;
-  margin: 0 !important;
-  border: 0 !important;
-  box-shadow: none !important;
-  background: transparent !important;
-  font-size: calc(var(--gx-font-base) * var(--gx-font-mul) * var(--gx-font-scale)) !important;
-  line-height: 1.25 !important;
-  color: var(--gx-text) !important;
-}
-
-/* Author line: tight, single-line. */
-.gx-cell [data-testid="UserAvatar-Container"],
-.gx-cell .gx-avatar-root {
-  margin: 0 6px 4px 0 !important;
-}
-.gx-cell [data-testid="UserAvatar-Container"] img,
-.gx-cell img.gx-avatar {
-  width: 22px !important;
-  height: 22px !important;
-  border-radius: 50% !important;
-  object-fit: cover !important;
-}
-/* Hide avatars when disabled or in scan mode. */
-#gridx-root.gx-hide-avatar .gx-cell [data-testid="UserAvatar-Container"],
-#gridx-root.gx-hide-avatar .gx-cell img.gx-avatar,
-#gridx-root.gx-scan .gx-cell [data-testid="UserAvatar-Container"],
-#gridx-root.gx-scan .gx-cell img.gx-avatar {
-  display: none !important;
-}
-
-/* Tweet text: clamp to 2 lines by default, expand on .gx-expanded. */
-.gx-cell [data-testid="tweetText"],
-.gx-cell .gx-text {
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
-  margin: 0 0 4px !important;
-  font-size: inherit !important;
-  line-height: 1.25 !important;
-  color: inherit !important;
-  word-break: break-word;
-  white-space: normal;
-}
-.gx-cell.gx-expanded [data-testid="tweetText"],
-.gx-cell.gx-expanded .gx-text {
-  -webkit-line-clamp: unset;
-  overflow: visible;
-}
-
-/* Action bar (metrics row): compact, one line. */
-.gx-cell [role="group"],
-.gx-cell .gx-actions {
-  all: unset !important;
-  display: flex !important;
-  flex-wrap: wrap !important;
-  gap: 8px !important;
-  margin-top: 2px !important;
-  font-size: 11px !important;
-  color: var(--gx-muted) !important;
-}
-.gx-cell [role="group"] [role="button"] {
-  all: unset !important;
-  display: inline-flex !important;
-  align-items: center !important;
-  gap: 2px !important;
-  font-size: 11px !important;
-  color: var(--gx-muted) !important;
-  cursor: pointer !important;
-}
-#gridx-root.gx-hide-metrics .gx-cell [role="group"],
-#gridx-root.gx-hide-metrics .gx-cell .gx-actions,
-#gridx-root.gx-scan .gx-cell [role="group"],
-#gridx-root.gx-scan .gx-cell .gx-actions {
-  display: none !important;
-}
-
-/* Any media inside a cell. */
-.gx-cell img {
-  max-width: 100% !important;
-  height: auto !important;
-  border-radius: 6px !important;
-}
-.gx-cell [data-testid="tweetPhoto"],
-.gx-cell .gx-media {
-  margin-top: 4px !important;
-}
-#gridx-root.gx-hide-media .gx-cell [data-testid="tweetPhoto"],
-#gridx-root.gx-hide-media .gx-cell .gx-media,
-#gridx-root.gx-hide-media .gx-cell img.gx-media-img,
-#gridx-root.gx-scan .gx-cell [data-testid="tweetPhoto"],
-#gridx-root.gx-scan .gx-cell .gx-media {
-  display: none !important;
-}
-/* The [video]/[image]/[gif] chip on a cell reveals the media in-cell on click,
-   even when media are otherwise hidden (m key / chip click). */
-#gridx-root.gx-hide-media .gx-cell.gx-media-open [data-testid="tweetPhoto"],
-#gridx-root.gx-hide-media .gx-cell.gx-media-open .gx-media,
-#gridx-root.gx-scan .gx-cell.gx-media-open [data-testid="tweetPhoto"],
-#gridx-root.gx-scan .gx-cell.gx-media-open .gx-media {
-  display: block !important;
-}
-
-/* --- GridX micro-labels ------------------------------------------------ */
-.gx-cell .gx-chip {
-  display: inline-block;
-  margin: 2px 0;
-  padding: 1px 5px;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1.4;
-  color: var(--gx-muted);
-  background: var(--gx-chip-bg);
-  border-radius: 4px;
-  }
-.gx-cell.gx-ad .gx-chip.gx-chip-ad {
-  color: #fff;
-  background: #f91880;
-}
-/* Retweet marker in the author line. */
-.gx-cell .gx-chip.gx-chip-rt {
-  color: #00ba7c;
-  background: transparent;
-}
-/* Media chip. */
-.gx-cell .gx-chip.gx-chip-media {
-  cursor: pointer;
-  border: 1px solid var(--gx-border);
-}
-.gx-cell.gx-expanded .gx-chip.gx-chip-media {
-  display: none;
-}
-
-/* Overflow ("≡") button top-right of each cell. */
-.gx-cell .gx-overflow {
-  position: absolute;
-  top: 2px;
-  right: 4px;
-  z-index: 5;
-  padding: 0 4px;
-  font-size: 13px;
-  line-height: 1;
-  color: var(--gx-muted);
-  background: transparent;
-  border: 0;
-  cursor: pointer;
-  opacity: 0.7;
-}
-.gx-cell:hover .gx-overflow {
-  opacity: 1;
-}
-
-/* Quoted-collapse marker. */
-.gx-cell .gx-chip.gx-chip-quote {
-  color: var(--gx-muted);
-  font-style: italic;
-}
-
-/* Kill X animations/transitions on the grid path. */
-#gridx-root *,
-#gridx-root {
-  animation: none !important;
-  transition: none !important;
 }

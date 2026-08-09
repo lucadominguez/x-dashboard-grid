@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "GridX — High-Density X Dashboard",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Turn the live X (twitter.com) app into a high-density, multi-column grid dashboard for scanning dozens of posts at once.",
   "permissions": [
     "storage"
