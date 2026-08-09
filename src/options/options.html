@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GridX Options</title>
+  <link rel="stylesheet" href="options.css" />
+</head>
+<body>
+  <main class="wrap">
+    <h1>▦ GridX Options</h1>
+
+    <section class="card">
+      <h2>Layout</h2>
+      <label class="row">
+        <span>Columns <b id="gx-cols-val">3</b></span>
+        <input id="gx-cols" type="range" min="1" max="8" step="1" value="3" />
+      </label>
+      <div class="row">
+        <span>Density</span>
+        <div class="seg" id="gx-density">
+          <button data-v="compact">Compact</button>
+          <button data-v="cozy">Cozy</button>
+          <button data-v="roomy">Roomy</button>
+        </div>
+      </div>
+      <label class="row">
+        <span>Font scale <b id="gx-font-val">1.0×</b></span>
+        <input id="gx-font" type="range" min="0.8" max="1.4" step="0.05" value="1.0" />
+      </label>
+      <label class="check">
+        <input id="gx-bleed" type="checkbox" /> Bleed mode (edge-to-edge, no gutter)
+      </label>
+    </section>
+
+    <section class="card">
+      <h2>Content</h2>
+      <div class="checkgrid">
+        <label class="check"><input id="gx-showMedia" type="checkbox" /> Show media thumbnails</label>
+        <label class="check"><input id="gx-showMetrics" type="checkbox" /> Show metrics (replies/RT/likes)</label>
+        <label class="check"><input id="gx-showAvatars" type="checkbox" /> Show avatars</label>
+        <label class="check"><input id="gx-hidePromoted" type="checkbox" /> Hide promoted posts</label>
+        <label class="check"><input id="gx-hideRetweets" type="checkbox" /> Hide reposts</label>
+        <label class="check"><input id="gx-hideVerified" type="checkbox" /> Hide verified accounts</label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Filters</h2>
+      <div class="row">
+        <label>Keyword presets
+          <div class="presetrow">
+            <select id="gx-filter-presets"><option value="">(pick to load)</option></select>
+            <input id="gx-filter-name" type="text" placeholder="preset name" />
+            <button id="gx-filter-save" class="btn">Save</button>
+            <button id="gx-filter-del" class="btn danger">Delete</button>
+          </div>
+        </label>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>Column presets</h2>
+      <div class="row">
+        <select id="gx-col-presets"><option value="">(pick to load)</option></select>
+        <input id="gx-col-name" type="text" placeholder="preset name" />
+        <button id="gx-col-save" class="btn">Save current</button>
+        <button id="gx-col-del" class="btn danger">Delete</button>
+      </div>
+      <p class="hint">Save the current layout (columns/density/font/bleed) as a named preset. "Dense", "Scan", "Readable"…</p>
+    </section>
+
+    <section class="card">
+      <h2>Keyboard map <span class="tag">read-only in v0.1</span></h2>
+      <table class="keys">
+        <tr><td>j / k · ↓ / ↑</td><td>next / previous post</td></tr>
+        <tr><td>h / l · ← / →</td><td>previous / next column</td></tr>
+        <tr><td>g / G</td><td>top / bottom</td></tr>
+        <tr><td>d / u</td><td>half page down / up</td></tr>
+        <tr><td>Space / Shift+Space</td><td>page down / up</td></tr>
+        <tr><td>Enter</td><td>open post in new tab</td></tr>
+        <tr><td>o</td><td>open post in same tab</td></tr>
+        <tr><td>Backspace</td><td>go back</td></tr>
+        <tr><td>x / m</td><td>expand text / toggle media</td></tr>
+        <tr><td>f / s / p</td><td>focus filter / scan / pause</td></tr>
+        <tr><td>? / Esc</td><td>keymap overlay / close</td></tr>
+        <tr><td>Ctrl+Shift+G / Ctrl+Shift+P</td><td>browser-level: toggle grid / pause</td></tr>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Extra CSS <span class="tag">advanced</span></h2>
+      <textarea id="gx-extra-css" rows="6" spellcheck="false"
+        placeholder="CSS appended to the grid, e.g.&#10;.gx-cell { border-radius: 0; }"></textarea>
+      <div class="rowbtns">
+        <button id="gx-css-apply" class="btn">Apply</button>
+        <button id="gx-reset" class="btn danger">Reset to defaults</button>
+      </div>
+      <p class="hint">Loaded live into the grid; applies to open tabs on the next update.</p>
+    </section>
+
+    <div id="gx-status" class="status"></div>
+  </main>
+  <script src="options.js"></script>
+</body>
+</html>

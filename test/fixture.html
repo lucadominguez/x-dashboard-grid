@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>GridX Test Fixture — fake X timeline</title>
+  <style>
+    /* Minimal "X-like" timeline so the grid has something real to hoist.
+       The GridX content script does the heavy lifting; this page is deliberately
+       plain so the fixture only exercises the DOM-contract, not X's real markup. */
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #fff; color: #0f1419; }
+    [data-testid="primaryColumn"] { max-width: 600px; margin: 0 auto; border-right: 1px solid #e6e8eb; border-left: 1px solid #e6e8eb; min-height: 100vh; }
+    section header { padding: 12px 16px; border-bottom: 1px solid #e6e8eb; font-weight: 700; }
+    article { display: flex; gap: 10px; padding: 12px 16px; border-bottom: 1px solid #e6e8eb; }
+    article img.avatar { width: 40px; height: 40px; border-radius: 50%; background: #e1e8ed; }
+    article .body { flex: 1; min-width: 0; }
+    article .meta { color: #536471; font-size: 14px; }
+    article .meta a { color: #0f1419; font-weight: 700; text-decoration: none; }
+    article [data-testid="tweetText"] { margin: 4px 0; }
+    article [role="group"] { display: flex; gap: 20px; color: #536471; font-size: 13px; margin-top: 6px; }
+    article [role="group"] [role="button"] { cursor: pointer; }
+    article [data-testid="tweetPhoto"] { margin-top: 6px; }
+    article [data-testid="tweetPhoto"] img { max-width: 100%; border-radius: 12px; }
+    article .repost-note { color: #536471; font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+    .sponsor-tag { color: #f91880; font-size: 11px; font-weight: 700; }
+    .tombstone { border: 1px solid #e6e8eb; border-radius: 12px; padding: 8px; margin-top: 6px; font-size: 13px; color: #536471; }
+    #load-more { display: block; margin: 16px auto; padding: 10px 18px; border: 1px solid #e6e8eb; border-radius: 999px; background: #fff; cursor: pointer; font-size: 14px; }
+    #load-more:hover { background: #eef3f8; }
+  </style>
+</head>
+<body>
+  <div data-testid="primaryColumn">
+    <section aria-label="Home timeline" data-testid="primaryColumn">
+      <header>Home</header>
+      <div id="stream">
+        <!-- 30 articles injected by the script below -->
+      </div>
+      <button id="load-more" type="button">Load more</button>
+    </section>
+  </div>
+
+  <script>
+    (function () {
+      'use strict';
+      var AVATAR = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="40" height="40"%3E%3Ccircle cx="20" cy="20" r="18" fill="%23b8c4cf"/%3E%3C/svg%3E';
+
+      var handles = ['alice', 'bob', 'carol', 'dave', 'erin', 'frank', 'grace', 'henry', 'ivy', 'jane'];
+      var names = ['Alice Chen', 'Bob Rivera', 'Carol Kim', 'Dave Ortiz', 'Erin Wu', 'Frank Mills', 'Grace Lim', 'Henry Ford', 'Ivy Clark', 'Jane Doe'];
+      var verbs = ['launched', 'built', 'shipped', 'tweeted about', 'wrote a thread on', 'explained', 'demoed', 'loves'];
+      var topics = ['the new dashboard', 'css grid layouts', 'Playwright testing', 'MV3 extensions', 'typography', 'dark mode', 'vim keybindings', 'edge cases', 'performance', 'web workers'];
+
+      // Banana posts: article indexes 2, 15, 28 contain the word "banana".
+      // Promoted "ad" posts: indexes 5, 11. Repost: index 9. Quoted: index 20.
+      // Image media: indexes 4, 27.
+      function makeArticle(i) {
+        var a = document.createElement('article');
+        a.setAttribute('data-testid', 'tweet');
+
+        var avatarWrap = document.createElement('div');
+        avatarWrap.setAttribute('data-testid', 'UserAvatar-Container');
+        var img = document.createElement('img');
+        img.className = 'avatar';
+        img.src = AVATAR;
+        img.alt = '';
+        avatarWrap.appendChild(img);
+        a.appendChild(avatarWrap);
+
+        var body = document.createElement('div');
+        body.className = 'body';
+
+        if (i === 9) {
+          var note = document.createElement('div');
+          note.className = 'repost-note';
+          note.textContent = 'Reposted by carol';
+          body.appendChild(note);
+        }
+        if (i === 5 || i === 11) {
+          var sponsor = document.createElement('div');
+          sponsor.className = 'sponsor-tag';
+          sponsor.textContent = 'Ad';
+          body.appendChild(sponsor);
+        }
+
+        var meta = document.createElement('div');
+        meta.className = 'meta';
+        var link = document.createElement('a');
+        link.href = '/' + handles[i % 10] + '/status/' + (1000 + i);
+        link.textContent = names[i % 10];
+        meta.appendChild(link);
+        meta.appendChild(document.createTextNode(' @' + handles[i % 10] + ' · ' + (i + 2) + 'm'));
+        body.appendChild(meta);
+
+        if (i === 5) {
+          // The ad link must carry the aria-label*s*sponsored marker.
+          link.setAttribute('aria-label', 'Sponsored — ' + link.textContent);
+        }
+
+        var textEl = document.createElement('div');
+        textEl.setAttribute('data-testid', 'tweetText');
+        var text = '@' + handles[(i + 1) % 10] + ' ' + verbs[i % verbs.length] + ' ' + topics[i % topics.length] + ' — post number ' + (i + 1) + '.';
+        if (i === 2 || i === 15 || i === 28) {
+          text += ' I ate a banana with my coffee this morning and it was great.';
+        }
+        textEl.textContent = text;
+        body.appendChild(textEl);
+
+        if (i === 20) {
+          var tomb = document.createElement('div');
+          tomb.setAttribute('data-testid', 'tombstone');
+          tomb.className = 'tombstone';
+          tomb.textContent = '❝ @erin: quoted content inline preview…';
+          body.appendChild(tomb);
+        }
+
+        if (i === 4 || i === 27) {
+          var photo = document.createElement('div');
+          photo.setAttribute('data-testid', 'tweetPhoto');
+          var pimg = document.createElement('img');
+          pimg.src = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="200" height="110"%3E%3Crect width="200" height="110" fill="%23d7e3ec"/%3E%3Crect x="8" y="64" width="184" height="10" fill="%23aec6da"/%3E%3Crect x="8" y="82" width="120" height="10" fill="%23aec6da"/%3E%3C/svg%3E';
+          pimg.alt = 'media thumbnail';
+          photo.appendChild(pimg);
+          body.appendChild(photo);
+        }
+
+        var group = document.createElement('div');
+        group.setAttribute('role', 'group');
+        [['reply', 'Replies', 12], ['retweet', 'Reposts', 34], ['like', 'Likes', 56],
+         ['view', 'Views', 1700]].forEach(function (c) {
+          var b = document.createElement('div');
+          b.setAttribute('role', 'button');
+          b.setAttribute('data-testid', c[0]);
+          b.textContent = c[1] + ' ' + c[2];
+          group.appendChild(b);
+        });
+        body.appendChild(group);
+
+        a.appendChild(body);
+        return a;
+      }
+
+      var stream = document.getElementById('stream');
+      function appendN(count) {
+        for (var i = 0; i < count; i++) {
+          stream.appendChild(makeArticle(i));
+        }
+      }
+      appendN(30);
+
+      var loadMore = document.getElementById('load-more');
+      var extra = 0;
+      loadMore.addEventListener('click', function () {
+        appendN(5);
+        extra += 5;
+        loadMore.textContent = 'Load more (' + (30 + extra) + ' loaded)';
+      });
+    })();
+  </script>
+</body>
+</html>

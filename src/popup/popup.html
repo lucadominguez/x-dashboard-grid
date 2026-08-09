@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>GridX</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <header class="gx-head">
+    <span class="gx-logo">▦</span>
+    <h1>GridX</h1>
+    <span id="gx-status-dot" class="dot" title="Grid inactive"></span>
+  </header>
+
+  <section class="gx-section">
+    <label class="row">
+      <span>Columns <b id="gx-cols-val">3</b></span>
+      <input id="gx-cols" type="range" min="1" max="8" step="1" value="3" />
+    </label>
+  </section>
+
+  <section class="gx-section gx-seg-row">
+    <span>Density</span>
+    <div class="seg" id="gx-density">
+      <button data-v="compact">Compact</button>
+      <button data-v="cozy">Cozy</button>
+      <button data-v="roomy">Roomy</button>
+    </div>
+  </section>
+
+  <section class="gx-section gx-toggles" id="gx-toggles">
+    <button data-k="showMedia">Media</button>
+    <button data-k="showMetrics">Metrics</button>
+    <button data-k="showAvatars">Avatars</button>
+    <button data-k="hidePromoted">Filter promoted</button>
+    <button data-k="hideRetweets">Filter reposts</button>
+    <button data-k="hideVerified">Filter verified</button>
+  </section>
+
+  <section class="gx-section">
+    <input id="gx-filter" type="text"
+      placeholder="Quick filter (hide terms, comma separated)" spellcheck="false" />
+    <div class="mini-actions">
+      <button id="gx-filter-clear" class="link">Clear filter</button>
+    </div>
+  </section>
+
+  <section class="gx-section gx-actions">
+    <button id="gx-scan" class="wide">Scan mode</button>
+    <button id="gx-pause" class="wide">Pause grid</button>
+  </section>
+
+  <section class="gx-stats" id="gx-stats">
+    <span>posts <b id="s-posts">–</b></span>
+    <span>hidden <b id="s-hidden">–</b></span>
+    <span>cols <b id="s-cols">–</b></span>
+    <span>up <b id="s-up">–</b></span>
+  </section>
+
+  <footer class="gx-foot">
+    <a id="gx-options" href="#">Options</a>
+    <span id="gx-error"></span>
+  </footer>
+
+  <script src="popup.js"></script>
+</body>
+</html>
