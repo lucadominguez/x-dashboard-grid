@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>GridX Options</title>
+<style>
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f1116;color:#e7e9ea;max-width:720px;margin:40px auto;padding:0 20px;}
+  h1{color:#00e5ff;} h2{font-size:16px;margin-top:24px;color:#8b98a5;}
+  label{display:block;margin:10px 0 4px;color:#8b98a5;font-size:12px;text-transform:uppercase;letter-spacing:.03em;}
+  input[type=range]{width:320px;} select,input[type=text],textarea{background:#16181d;color:#e7e9ea;border:1px solid #2f3336;border-radius:4px;padding:6px;width:100%;box-sizing:border-box;}
+  button{background:#00e5ff;color:#0f1116;border:0;border-radius:4px;padding:8px 14px;cursor:pointer;font-weight:600;margin:4px 4px 4px 0;}
+  table{border-collapse:collapse;width:100%;} td,th{border:1px solid #2f3336;padding:6px;text-align:left;font-size:13px;}
+  .row{display:flex;align-items:center;gap:10px;}
+  .hint{color:#8b98a5;font-size:12px;margin:4px 0 0;text-transform:none;letter-spacing:0;}
+</style></head>
+<body>
+  <h1>GridX Options</h1>
+  <h2>Layout</h2>
+  <label>Columns (1-8)</label><div class="row"><input type="range" id="cols" min="1" max="8" value="3"><span id="cols-v">3</span></div>
+  <label>Density</label>
+  <select id="density"><option value="compact">Compact</option><option value="cozy">Cozy</option><option value="roomy">Roomy</option></select>
+  <label>Font scale</label><div class="row"><input type="range" id="font" min="80" max="140" value="100"><span id="font-v">1.0x</span></div>
+
+  <h2>Performance</h2>
+  <label>Posts kept in the grid</label>
+  <div class="row"><input type="range" id="maxcells" min="50" max="2000" step="50" value="300"><span id="maxcells-v">300</span></div>
+  <p class="hint">The grid keeps the newest N posts and drops older ones off the top as you scroll. Higher values use more memory; the cap is what stops a long session from locking up the tab.</p>
+  <div class="row"><input type="checkbox" id="autoadvance" checked><label for="autoadvance">Load more posts when I reach the end</label></div>
+  <p class="hint">The grid covers X's own timeline, so it nudges the page underneath to fetch the next batch.</p>
+
+  <h2>Display</h2>
+  <div class="row"><input type="checkbox" id="media"><label for="media">Show media</label></div>
+  <div class="row"><input type="checkbox" id="avatars"><label for="avatars">Show avatars</label></div>
+  <div class="row"><input type="checkbox" id="metrics"><label for="metrics">Show metrics</label></div>
+  <div class="row"><input type="checkbox" id="retweets"><label for="retweets">Hide retweets</label></div>
+  <div class="row"><input type="checkbox" id="promoted" checked><label for="promoted">Hide promoted</label></div>
+  <div class="row"><input type="checkbox" id="verified"><label for="verified">Hide verified badges</label></div>
+
+  <h2>Filters</h2>
+  <label>Keyword filters (comma separated)</label><input type="text" id="keywords" placeholder="crypto, ai">
+  <label>Handle filters (comma separated, hides these accounts)</label><input type="text" id="handles" placeholder="@spam, @adbot">
+
+  <h2>Advanced</h2>
+  <label>Extra CSS</label><textarea id="extra" rows="3"></textarea>
+
+  <h2>Keyboard map</h2>
+  <table>
+    <tr><th>Key</th><th>Action</th></tr>
+    <tr><td>j / ↓</td><td>Down one row</td></tr>
+    <tr><td>k / ↑</td><td>Up one row</td></tr>
+    <tr><td>h / ←</td><td>Left one post</td></tr>
+    <tr><td>l / →</td><td>Right one post</td></tr>
+    <tr><td>g / G</td><td>Top / bottom</td></tr>
+    <tr><td>s</td><td>Toggle scan mode</td></tr>
+    <tr><td>x</td><td>Expand current cell</td></tr>
+    <tr><td>p</td><td>Pause / resume</td></tr>
+    <tr><td>f</td><td>Focus filter</td></tr>
+    <tr><td>Enter / o</td><td>Open post in new tab</td></tr>
+    <tr><td>Click</td><td>Open post in new tab (ctrl-click and middle-click work too)</td></tr>
+  </table>
+
+  <div style="margin-top:20px">
+    <button id="save">Save</button>
+    <button id="reset">Reset to defaults</button>
+  </div>
+  <div id="status" style="color:#00e5ff;margin-top:8px"></div>
+  <script src="options.js"></script>
+</body>
+</html>

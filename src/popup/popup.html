@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { width: 280px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         background: #0f1116; color: #e7e9ea; margin: 0; padding: 12px; font-size: 13px; }
+  h1 { font-size: 14px; margin: 0 0 8px; color: #00e5ff; }
+  label { display: block; margin: 8px 0 4px; color: #8b98a5; font-size: 11px; text-transform: uppercase; letter-spacing: .03em; }
+  input[type=range] { width: 100%; }
+  .row { display: flex; align-items: center; justify-content: space-between; margin: 5px 0; }
+  .toggle { display: flex; align-items: center; gap: 6px; }
+  button { background: #00e5ff; color: #0f1116; border: 0; border-radius: 4px; padding: 6px 10px; cursor: pointer; font-weight: 600; width: 100%; margin-top: 10px; }
+  a { color: #00e5ff; font-size: 11px; }
+  .stats { margin-top: 8px; font-size: 11px; color: #8b98a5; }
+</style>
+</head>
+<body>
+  <h1>GridX</h1>
+  <label>Columns</label>
+  <input type="range" id="cols" min="1" max="8" value="3">
+  <div class="row"><span>Density</span>
+    <select id="density">
+      <option value="compact">Compact</option>
+      <option value="cozy">Cozy</option>
+      <option value="roomy">Roomy</option>
+    </select>
+  </div>
+  <div class="toggle"><input type="checkbox" id="scan"><label for="scan">Scan mode (max density)</label></div>
+  <div class="toggle"><input type="checkbox" id="media"><label for="media">Show media</label></div>
+  <div class="toggle"><input type="checkbox" id="metrics"><label for="metrics">Show metrics</label></div>
+  <div class="toggle"><input type="checkbox" id="promoted" checked><label for="promoted">Hide promoted</label></div>
+  <label for="filter">Filter keywords (comma)</label>
+  <input type="text" id="filter" style="width:100%;box-sizing:border-box;background:#16181d;color:#e7e9ea;border:1px solid #2f3336;border-radius:4px;padding:4px;">
+  <div class="stats" id="stats">Grid: idle</div>
+  <button id="toggle-btn">Enable Grid</button>
+  <a href="#" id="options">Open options</a>
+  <script src="popup.js"></script>
+</body>
+</html>
