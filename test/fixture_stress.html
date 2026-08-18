@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en" data-gridx-site="reddit">
+<head>
+<meta charset="utf-8">
+<title>Stress fixture - GridX</title>
+<!--
+  A feed that churns the way a real one does. Static fixtures hide GridX's cost
+  because nothing mutates; X and Reddit mutate constantly:
+    - relative timestamps tick ("2 hr. ago" -> "3 hr. ago")
+    - score / comment counts update
+    - new posts stream in
+    - the site re-renders subtrees under virtualization
+  This reproduces that churn so the MutationObserver path is actually exercised.
+  Knobs via query string: ?posts=400&churn=100&append=250
+-->
+<style>
+  body { margin:0; font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#f6f7f8; }
+  .grid-container { display:grid; grid-template-columns: 240px minmax(0,1fr); gap:16px; }
+  .subgrid-container { max-width:760px; box-sizing:border-box; padding:12px; }
+  shreddit-feed { display:block; }
+  article { display:block; margin:0 0 8px; }
+  shreddit-post, shreddit-ad-post {
+    display:block; background:#fff; border:1px solid #ccc; border-radius:8px;
+    padding:10px; margin-bottom:8px; min-height:110px; box-sizing:border-box;
+  }
+  .pt { font-weight:600; margin:2px 0 6px; }
+  .meta { color:#777; font-size:12px; }
+  .buttons { display:flex; gap:10px; color:#777; font-size:12px; margin-top:6px; }
+  .body { margin:6px 0; }
+  .w { display:block; }
+  .t { color:#555; font-size:12px; margin-right:4px; }
+  .av { display:inline-block; width:16px; height:16px; border-radius:50%;
+        background:linear-gradient(135deg,#cfd9df,#a1c4fd); vertical-align:middle; margin-right:5px; }
+  hr { border:0; border-top:1px solid #e2e2e2; margin:8px 0; }
+  #sentinel { height:24px; }
+</style>
+</head>
+<body>
+<div class="grid-container">
+  <div id="left-sidebar">nav</div>
+  <div class="subgrid-container">
+    <main id="main-content">
+      <shreddit-feed></shreddit-feed>
+      <div id="sentinel"></div>
+    </main>
+  </div>
+</div>
+<script>
+const Q = new URLSearchParams(location.search);
+const N0     = +(Q.get('posts')  || 600);
+const CHURN  = +(Q.get('churn')  || 100);   // ms between attribute/text churn
+const APPEND = +(Q.get('append') || 250);   // ms between new-post batches
+const MAXP   = +(Q.get('max')    || 800);   // cap so both phases measure the same DOM
+const SUBS = ['programming','AskReddit','science','webdev','todayilearned','space'];
+const WORDS = ['kubernetes','harbour','printing','glacier','protocol','sandwich','telescope',
+               'archive','compiler','mycology','bicycle','notation','plumbing','asteroid'];
+let n = 0;
+const feed = document.querySelector('shreddit-feed');
+
+function makePost(i) {
+  const sub = SUBS[i % SUBS.length];
+  const title = WORDS[i % WORDS.length] + ' ' + WORDS[(i*7+3) % WORDS.length] + ' thread number ' + i;
+  const permalink = '/r/' + sub + '/comments/' + (1000000+i) + '/' + title.toLowerCase().replace(/\s+/g,'_') + '/';
+  const p = document.createElement('shreddit-post');
+  p.setAttribute('permalink', permalink);
+  p.setAttribute('post-title', title);
+  p.setAttribute('author', 'user_' + i);
+  p.setAttribute('subreddit-prefixed-name', 'r/' + sub);
+  p.setAttribute('score', String(50 + (i*37) % 4000));
+  p.setAttribute('comment-count', String((i*13) % 700));
+  // Real feed cards are 150-300 nodes of nested wrappers, not 10. Post weight
+  // is what makes per-post innerText reads expensive, so the fixture has to
+  // carry it or the measurement is meaningless.
+  let filler = '';
+  for (let k = 0; k < 18; k++) {
+    filler += '<div class="w"><div class="w"><span class="t">' + WORDS[(i+k) % WORDS.length] +
+              '</span><span class="t"> ' + ((i*k) % 997) + '</span></div></div>';
+  }
+  p.innerHTML =
+    '<div class="meta"><span class="av"></span>r/' + sub + ' &middot; u/user_' + i +
+      ' &middot; <span class="age">1</span> hr. ago</div>' +
+    '<div class="pt"><a href="' + permalink + '">' + title + '</a></div>' +
+    '<div class="body">' + filler + '</div>' +
+    '<div class="buttons"><span class="cc">' + ((i*13)%700) + ' comments</span>' +
+      '<span>share</span><span>save</span><span>hide</span><span>report</span></div>';
+  const art = document.createElement('article');
+  art.className = 'w-full m-0';
+  art.appendChild(p);
+  return art;
+}
+function makeAd(i) {
+  const ad = document.createElement('shreddit-ad-post');
+  ad.setAttribute('promoted','');
+  ad.setAttribute('permalink','/r/ads/comments/' + (9000000+i) + '/sponsored_' + i + '/');
+  ad.innerHTML = '<div class="meta">promoted</div><div class="pt">Sponsored placement ' + i + '</div>';
+  return ad;
+}
+function appendPage(count) {
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < count; i++, n++) {
+    frag.appendChild(n % 9 === 8 ? makeAd(n) : makePost(n));
+    frag.appendChild(document.createElement('hr'));
+  }
+  feed.appendChild(frag);
+}
+appendPage(N0);
+
+// Timestamp / counter churn, the way a live feed ticks. Touches a slice of the
+// feed on every tick so the observer sees a steady stream of mutations.
+let tick = 0;
+setInterval(() => {
+  tick++;
+  const ages = feed.querySelectorAll('.age');
+  const start = (tick * 17) % Math.max(1, ages.length);
+  for (let i = start; i < Math.min(start + 25, ages.length); i++) {
+    ages[i].textContent = String(1 + ((tick + i) % 23));
+  }
+  const posts = feed.querySelectorAll('shreddit-post');
+  for (let i = start; i < Math.min(start + 10, posts.length); i++) {
+    posts[i].setAttribute('score', String(50 + ((tick * 31 + i) % 4000)));
+  }
+}, CHURN);
+
+// New posts streaming in.
+setInterval(() => { if (n < MAXP) appendPage(5); }, APPEND);
+
+// Infinite scroll.
+const sentinel = document.getElementById('sentinel');
+const io = new IntersectionObserver((es) => {
+  for (const e of es) {
+    if (!e.isIntersecting || n >= MAXP) continue;
+    appendPage(12);
+    document.getElementById('main-content').appendChild(sentinel);
+    io.unobserve(sentinel);
+    requestAnimationFrame(() => io.observe(sentinel));
+  }
+}, { rootMargin: '300px' });
+io.observe(sentinel);
+
+// --- instrumentation the perf harness reads -------------------------------
+window.__perf = { longTasks: [], frames: [] };
+window.__postCount = () => n;
+window.__atCap = () => n >= MAXP;
+try {
+  new PerformanceObserver((l) => {
+    for (const e of l.getEntries()) window.__perf.longTasks.push(Math.round(e.duration));
+  }).observe({ entryTypes: ['longtask'] });
+} catch (e) {}
+let last = performance.now();
+function frame(t) { window.__perf.frames.push(Math.round(t - last)); last = t; requestAnimationFrame(frame); }
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
