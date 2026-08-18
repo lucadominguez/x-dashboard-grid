@@ -46,6 +46,8 @@
   const NS = 'gridx';
   const CLASS_ACTIVE = 'gridx-active';
   const CLASS_SCAN = 'gridx-scan';
+  const CLASS_UNVIRT = 'gx-unvirtualized';
+  const CLASS_LOCK = 'gx-lock-scroll';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
 
@@ -313,6 +315,22 @@
     return withArticle >= 2 && withArticle >= kids.length * 0.5;
   }
 
+  // Which element actually owns the scroll? Guessing this per-site was wrong:
+  // x.com scrolls the DOCUMENT (its timeline is a tall container with a virtual
+  // height), so locking body overflow froze the page outright. Measured once at
+  // activation, BEFORE we touch any styles, because applyGrid would otherwise
+  // make the host look like a scroller and the answer would always be yes.
+  let hostWasScroller = false;
+  function detectScroller(el) {
+    if (!el) return false;
+    try {
+      const cs = getComputedStyle(el);
+      const oy = cs.overflowY;
+      if (oy !== 'auto' && oy !== 'scroll') return false;
+      return el.scrollHeight > el.clientHeight + 20;
+    } catch (e) { return false; }
+  }
+
   function findHost() {
     const first = document.querySelector(ARTICLE);
     if (!first) return null;
@@ -351,16 +369,14 @@
     // Reddit scrolls the document: turning shreddit-feed into its own scroller
     // strands Reddit's infinite-scroll sentinel and kills pagination, so we
     // leave the page's native scroll model alone there.
-    if (SITE && SITE.ownScroller) {
+    if (hostWasScroller) {
+      // The feed container really is the scroller: keep it that way.
       setInline('overflowY', 'auto');
       setInline('overflowX', 'hidden');
       setInline('overscrollBehavior', 'contain');
       setInline('scrollBehavior', 'auto');
-      // Make sure the grid has room to scroll within the viewport. If the host
-      // is already a scroller (real X), leave its height alone; otherwise (e.g.
-      // the flat fixture `#stream`) constrain it so vertical scrolling works.
-      if (host.scrollHeight <= host.clientHeight) setInline('height', '100vh');
     } else {
+      // The document owns the scroll. Touch nothing that could freeze it.
       setInline('overflowX', 'hidden');
     }
 
@@ -376,7 +392,52 @@
     document.documentElement.classList.toggle('gx-hide-verified', !!settings.hideVerified);
     document.documentElement.classList.toggle('gx-bleed', !!settings.bleed);
 
+    // A virtualized feed positions its cells absolutely and places them with a
+    // transform (X does exactly this). Absolutely positioned children are OUT
+    // OF FLOW, so display:grid on the container has nothing to lay out and
+    // every post keeps its original full-width position: the grid appears to
+    // apply and visibly does nothing. Detect that and put the cells back in
+    // flow so the grid can actually place them.
+    if (detectOutOfFlow()) setTimeout(verifyUnvirtualize, 400);
     applyScanClass();
+  }
+
+  // Putting virtualized cells back in flow makes the grid work, but the
+  // container's height was what created the page's scroll range. On a feed that
+  // pages by scroll offset, removing it can leave the page unable to scroll at
+  // all - which is strictly worse than no grid. Verify, and back out if so.
+  let unvirtBlocked = false;
+  function verifyUnvirtualize() {
+    if (!active || !host) return;
+    const doc = document.documentElement;
+    if (!doc.classList.contains(CLASS_UNVIRT)) return;
+    const docRange = doc.scrollHeight - (window.innerHeight || 0);
+    const hostRange = host.scrollHeight - host.clientHeight;
+    const canScroll = docRange > 200 || hostRange > 200;
+    const hasMore = articles().length >= 8;
+    if (!canScroll && hasMore) {
+      doc.classList.remove(CLASS_UNVIRT);
+      unvirtBlocked = true;
+      setStatus('GridX: this feed is virtualized, keeping the site layout', 6000);
+      log('unvirtualize reverted: it removed the page scroll range');
+    }
+  }
+
+  function detectOutOfFlow() {
+    if (!host) return false;
+    const kids = Array.from(host.children).slice(0, 12)
+      .filter((k) => !(FILLER && k.matches && k.matches(FILLER)));
+    if (!kids.length) return false;
+    let abs = 0;
+    for (const k of kids) {
+      let pos = '';
+      try { pos = getComputedStyle(k).position; } catch (e) { continue; }
+      if (pos === 'absolute' || pos === 'fixed') abs++;
+    }
+    const outOfFlow = abs >= Math.max(2, kids.length * 0.5) && !unvirtBlocked;
+    document.documentElement.classList.toggle(CLASS_UNVIRT, outOfFlow);
+    if (outOfFlow) log('feed is virtualized/out-of-flow; cells put back in flow');
+    return outOfFlow;
   }
 
   function densityScale() {
@@ -662,6 +723,9 @@
     document.documentElement.classList.add(CLASS_ACTIVE);
     document.documentElement.classList.add('gridx-site-' + SITE.id);
     savedStyles = {};
+    hostWasScroller = detectScroller(host);
+    document.documentElement.classList.toggle(CLASS_LOCK, hostWasScroller);
+    log('scroll owner:', hostWasScroller ? 'feed container' : 'document');
     applyGrid();
     recomputeFilters();
     wireObserver();
@@ -697,6 +761,9 @@
     document.removeEventListener('keydown', onKeydown, true);
     document.documentElement.classList.remove(CLASS_ACTIVE, CLASS_SCAN);
     for (const s of SITES) document.documentElement.classList.remove('gridx-site-' + s.id);
+    document.documentElement.classList.remove(CLASS_UNVIRT, CLASS_LOCK);
+    unvirtBlocked = false;
+    hostWasScroller = false;
     replantAll();
     active = false;
     cursorArticle = null;
@@ -882,7 +949,7 @@
     focus(l[i < 0 ? 0 : Math.max(0, Math.min(l.length - 1, i + delta))]);
   }
   function scrollBy(f) {
-    if (host && SITE && SITE.ownScroller) { host.scrollTop += f * (host.clientHeight || 900); return; }
+    if (host && hostWasScroller) { host.scrollTop += f * (host.clientHeight || 900); return; }
     window.scrollBy(0, f * (window.innerHeight || 900));
   }
   function openCursor(sameTab) {

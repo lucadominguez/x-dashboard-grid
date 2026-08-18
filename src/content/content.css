@@ -24,9 +24,14 @@
 html.gridx-active,
 html.gridx-active body {
   scroll-behavior: auto !important;
+  /* Never a horizontal scrollbar: once the document owns the vertical scroll,
+     its scrollbar can push a 100%-width child a few px past the viewport. */
+  overflow-x: hidden !important;
 }
-html.gridx-active.gridx-site-x,
-html.gridx-active.gridx-site-x body {
+/* Only when the feed container is genuinely the scroller. x.com scrolls the
+   DOCUMENT, so applying this there froze the whole page. */
+html.gridx-active.gx-lock-scroll,
+html.gridx-active.gx-lock-scroll body {
   overflow: hidden !important;
 }
 
@@ -79,6 +84,32 @@ html.gridx-active {
 html.gridx-active .gx-stream > * {
   content-visibility: auto;
   contain-intrinsic-size: auto 220px;
+}
+
+/* ===========================================================================
+ * Virtualized feeds (X's timeline).
+ *
+ * X mounts a window of cells, each `position:absolute` with a translateY, and
+ * gives the container an explicit height so the scrollbar is right. Out-of-flow
+ * children are invisible to grid layout, so without this the grid applies and
+ * changes nothing. Only added when out-of-flow cells are actually detected, so
+ * a normal flow feed is never touched.
+ * ========================================================================== */
+html.gridx-active.gx-unvirtualized .gx-stream > * {
+  position: relative !important;
+  transform: none !important;
+  top: auto !important;
+  left: auto !important;
+  right: auto !important;
+  bottom: auto !important;
+  width: auto !important;
+  max-width: 100% !important;
+}
+/* The container's height was sized for the virtual list, not for what is
+   actually laid out; leaving it would strand the page in empty scroll space. */
+html.gridx-active.gx-unvirtualized .gx-stream {
+  min-height: 0 !important;
+  height: auto !important;
 }
 
 /* --- Filter / cursor / paused moon --------------------------------------- */

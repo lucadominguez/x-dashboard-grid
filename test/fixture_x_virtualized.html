@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>X virtualized timeline fixture - GridX</title>
+<!--
+  Replicates how X ACTUALLY renders its timeline, which the flat fixture.html
+  does not:
+
+    <div aria-label="Timeline: Your Home Timeline" style="position:relative; min-height:NNNNpx">
+      <div data-testid="cellInnerDiv" style="position:absolute; width:100%; transform:translateY(0px)">
+      <div data-testid="cellInnerDiv" style="position:absolute; width:100%; transform:translateY(543px)">
+      ...
+
+  Every cell is absolutely positioned and placed with a transform, and the
+  container carries an explicit height so the scrollbar is the right size. This
+  matters enormously: absolutely positioned children are OUT OF FLOW, so
+  `display:grid` on the container has nothing to lay out and every post stacks
+  at its own transform offset. A grid applied naively here looks broken.
+
+  The virtualizer below also recycles cells on scroll the way X does.
+-->
+<style>
+  body { margin:0; font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:#fff; color:#0f1419; }
+  header[role="banner"] { position:sticky; top:0; height:53px; border-bottom:1px solid #eff3f4;
+                          display:flex; align-items:center; padding:0 16px; background:#fff; z-index:3; }
+  main[role="main"] { display:flex; }
+  [data-testid="primaryColumn"] { width:600px; border-left:1px solid #eff3f4; border-right:1px solid #eff3f4; }
+  [data-testid="sidebarColumn"] { width:350px; padding:12px; }
+  article[data-testid="tweet"] { border-bottom:1px solid #eff3f4; padding:12px 16px; box-sizing:border-box; }
+  .nm { font-weight:700; } .hd { color:#536471; }
+  .tw { margin:4px 0 8px; }
+  [role="group"] { display:flex; gap:48px; color:#536471; font-size:13px; }
+  .av { width:40px; height:40px; border-radius:50%; background:#cfd9de; float:left; margin-right:12px; }
+</style>
+</head>
+<body>
+<header role="banner"><strong>Home</strong></header>
+<main role="main">
+  <div data-testid="primaryColumn">
+    <div id="tl" aria-label="Timeline: Your Home Timeline" style="position:relative;"></div>
+  </div>
+  <div data-testid="sidebarColumn">sidebar</div>
+</main>
+<script>
+const Q = new URLSearchParams(location.search);
+const TOTAL = +(Q.get('posts') || 300);
+const ROW_H = 190;                     // nominal height X assumes per cell
+const NAMES = ['Alice Chen','Bob Rivera','Carol Kim','Dave Ortiz','Erin Wu','Frank Mills'];
+const HANDLES = ['alice','bob','carol','dave','erin','frank'];
+const tl = document.getElementById('tl');
+
+function cell(i) {
+  const c = document.createElement('div');
+  c.setAttribute('data-testid', 'cellInnerDiv');
+  // This is the part that breaks a naive grid.
+  c.style.position = 'absolute';
+  c.style.width = '100%';
+  c.style.transform = 'translateY(' + (i * ROW_H) + 'px)';
+  c.dataset.idx = String(i);
+  const h = HANDLES[i % HANDLES.length];
+  c.innerHTML =
+    '<article data-testid="tweet">' +
+      '<div class="av"></div>' +
+      '<div><span class="nm">' + NAMES[i % NAMES.length] + '</span> ' +
+        '<span class="hd">@' + h + ' &middot; ' + (i % 59 + 1) + 'm</span></div>' +
+      '<div class="tw" data-testid="tweetText">post number ' + i +
+        ' about ' + ['grids','latency','coffee','kernels','typography','banana'][i % 6] + '</div>' +
+      '<a href="/' + h + '/status/' + (100000 + i) + '"><time>now</time></a>' +
+      '<div role="group">' +
+        '<div data-testid="reply">12</div><div data-testid="retweet">34</div>' +
+        '<div data-testid="like">56</div><div data-testid="viewCount">1700</div>' +
+      '</div>' +
+    '</article>';
+  return c;
+}
+
+// X keeps only a window of cells mounted and moves them as you scroll.
+let mounted = new Map();
+function virtualize() {
+  const top = window.scrollY;
+  const first = Math.max(0, Math.floor(top / ROW_H) - 4);
+  const last = Math.min(TOTAL - 1, Math.ceil((top + innerHeight) / ROW_H) + 4);
+  for (const [i, el] of mounted) {
+    if (i < first || i > last) { el.remove(); mounted.delete(i); }
+  }
+  for (let i = first; i <= last; i++) {
+    if (!mounted.has(i)) { const c = cell(i); tl.appendChild(c); mounted.set(i, c); }
+  }
+}
+tl.style.minHeight = (TOTAL * ROW_H) + 'px';
+virtualize();
+addEventListener('scroll', virtualize, { passive: true });
+
+window.__mountedCount = () => mounted.size;
+</script>
+</body>
+</html>
