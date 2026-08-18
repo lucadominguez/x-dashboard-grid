@@ -1,8 +1,19 @@
 /* ============================================================================
- * GridX content script — "CSS re-flow" architecture
+ * GridX content script - "CSS re-flow" architecture, multi-site
  * ----------------------------------------------------------------------------
- * v0.2: pivot from "DOM hoisting" (moving <article> nodes) to re-flowing X's
- * own timeline IN PLACE via CSS. This is a direct response to two real-world
+ * v0.3: the re-flow engine is site-agnostic and driven by the SITES adapter
+ * table below. X and Reddit are supported; adding a site is one table entry.
+ * Per-site facts that bit us in testing and are now encoded in the adapters:
+ *   - Reddit scrolls the DOCUMENT, X scrolls the feed container. We only take
+ *     over scrolling where the feed is the scroller; locking overflow on Reddit
+ *     freezes the page and strands its infinite-scroll sentinel.
+ *   - Reddit interleaves <hr> separators between entries, so they are excluded
+ *     from feed detection and hidden rather than each occupying a grid cell.
+ *   - Hiding a sidebar is not enough to reclaim its width: its grid TRACK
+ *     survives, so the feed container is told to span every track.
+ *
+ * v0.2: pivot from "DOM hoisting" (moving <article> nodes) to re-flowing the
+ * site's own timeline IN PLACE via CSS. This is a direct response to two real-world
  * failures of the hoisting build on live x.com:
  *
  *   1. RATE-LIMIT/block: hoisting EMPTIES X's timeline container, so X's
@@ -59,34 +70,83 @@
     debug: false,
   };
 
-  const S = {
-    primaryColumn: [
-      '[data-testid="primaryColumn"]',
-      'main section',
-      'main[role="main"]',
-    ],
-    article: ['article[data-testid="tweet"]', 'article'],
-    // Stream host candidate edges: containers we must NOT turn into a grid.
-    notHost: [
-      '[data-testid="primaryColumn"]',
-      '[data-testid="sidebarColumn"]',
-      '[data-testid="TopBar"]',
-      '[data-testid="topBar"]',
-      'header',
-      'nav',
-      'main',
-      'body',
-      'html',
-    ],
-    statusLink: ['a[href*="/status/"]'],
-    sponsored: ['a[aria-label*="sponsored"]'],
-    verified: ['[data-testid="icon-verified"]', 'svg[aria-label*="Verified"]'],
-    metricButtons: ['[role="group"] [role="button"]', '[role="button"]'],
-  };
+  /* ------------------------------------------------------------------ *
+   * Site adapters.
+   *
+   * Everything site-specific lives here: which element is a post, where its
+   * permalink comes from, and how to recognise an ad. The rest of GridX is
+   * site-agnostic and drives whichever adapter matches the current hostname.
+   *
+   * Reddit facts these are built on (verified against live www.reddit.com,
+   * not guessed): the feed is <shreddit-feed>; each post is a <shreddit-post>
+   * wrapped in an <article>; ads are <shreddit-ad-post> siblings that are NOT
+   * wrapped; <hr> separators sit between every entry; and the document, not
+   * the feed, owns the scroll.
+   * ------------------------------------------------------------------ */
+  const SITES = [
+    {
+      id: 'x',
+      label: 'X',
+      hosts: /(^|\.)(x|twitter)\.com$/i,
+      post: 'article[data-testid="tweet"], article',
+      // Containers we must never turn into a grid.
+      notHost: [
+        '[data-testid="primaryColumn"]', '[data-testid="sidebarColumn"]',
+        '[data-testid="TopBar"]', '[data-testid="topBar"]',
+        'header', 'nav', 'main', 'body', 'html',
+      ],
+      // Non-post filler among the host's children (excluded from host scoring
+      // and hidden in the grid so it never occupies a cell).
+      filler: '',
+      // X's timeline container is itself the scroller.
+      ownScroller: true,
+      permalink: (el) => { const l = el.querySelector('a[href*="/status/"]'); return l ? l.href : ''; },
+      sponsored: (el) => !!el.querySelector('a[aria-label*="sponsored"]'),
+      repost: (el) => /reposted/i.test(el.innerText || ''),
+      verified: (el) => !!el.querySelector('[data-testid="icon-verified"], svg[aria-label*="Verified"]'),
+    },
+    {
+      id: 'reddit',
+      label: 'Reddit',
+      hosts: /(^|\.)reddit\.com$/i,
+      // shreddit (current), plus old.reddit.com's markup.
+      post: 'shreddit-post, shreddit-ad-post, .thing.link',
+      notHost: [
+        'shreddit-app', '#main-content', '.subgrid-container', '.grid-container',
+        'header', 'nav', 'main', 'body', 'html',
+      ],
+      filler: 'hr',
+      // Reddit scrolls the document; the feed is not a scroller.
+      ownScroller: false,
+      permalink: (el) => {
+        const a = el.getAttribute && (el.getAttribute('permalink') || el.getAttribute('data-permalink'));
+        if (a) { try { return new URL(a, location.origin).href; } catch (e) {} }
+        const l = el.querySelector('a[href*="/comments/"]');
+        return l ? l.href : '';
+      },
+      sponsored: (el) => el.tagName.toLowerCase() === 'shreddit-ad-post' ||
+        (el.hasAttribute && (el.hasAttribute('promoted') || el.getAttribute('data-promoted') === 'true')),
+      // Reddit has no repost concept in the X sense; crossposts are ordinary posts.
+      repost: () => false,
+      verified: () => false,
+    },
+  ];
 
-  const ARTICLE = S.article.join(', ');
-  const STATUS_LINK = S.statusLink.join(', ');
-  const HIDE_CHROME = S.primaryColumn.join(', ');
+  function detectSite() {
+    const byHost = SITES.find((s) => s.hosts.test(location.hostname));
+    if (byHost) return byHost;
+    // Local fixtures declare which site's markup they emulate:
+    //   <html data-gridx-site="reddit">
+    if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+      const want = (document.documentElement.getAttribute('data-gridx-site') || 'x').toLowerCase();
+      return SITES.find((s) => s.id === want) || SITES[0];
+    }
+    return null;
+  }
+  const SITE = detectSite();
+
+  const ARTICLE = SITE ? SITE.post : 'article';
+  const FILLER = SITE ? SITE.filler : '';
 
   const SCAN_KEYS = [
     'columnCount', 'density', 'showAvatars', 'showMedia', 'showMetrics', 'fontScale',
@@ -152,8 +212,18 @@
   function matchesAny(el, sel) { return isEl(el) && el.matches(sel); }
   function selNotHost(el) {
     if (!isEl(el)) return true;
-    for (const s of S.notHost) if (el.matches(s)) return true;
+    for (const s of (SITE ? SITE.notHost : [])) { try { if (el.matches(s)) return true; } catch (e) {} }
     return false;
+  }
+  // The element that actually sits in the grid: walk up from the post to the
+  // host's direct child. On X that is [data-testid="cellInnerDiv"], on Reddit
+  // the <article> wrapping <shreddit-post>. Hiding or measuring the inner post
+  // instead would leave an empty cell behind.
+  function cellOf(post) {
+    if (!host || !isEl(post)) return post;
+    let el = post;
+    while (el.parentElement && el.parentElement !== host) el = el.parentElement;
+    return el.parentElement === host ? el : post;
   }
 
   /* ------------------------------------------------------------------ *
@@ -184,13 +254,14 @@
           <tr><td>f / s / p</td><td>focus filter / scan / pause</td></tr>
           <tr><td>? / Esc</td><td>keymap overlay / close</td></tr>
           <tr><td>Click post</td><td>open the real post in a new tab</td></tr>
+          <tr><td>Site</td><td class="gx-km-site">-</td></tr>
         </table>
         <p class="gx-km-note">Keys are ignored while typing.</p>
       </div>
       <div id="gridx-fatal" hidden>
-        <h1>GridX: timeline not found</h1>
-        <p>GridX could not locate the timeline container on this page.</p>
-        <p>This usually means X shipped a markup change, or you are not on a feed.</p>
+        <h1>GridX: feed not found</h1>
+        <p>GridX could not locate the feed container on this page.</p>
+        <p>This usually means the site shipped a markup change, or you are not on a feed.</p>
         <button id="gridx-fatal-close">Close GridX</button>
       </div>
       <div id="gridx-statusbar"><span class="gx-hints"></span><span class="gx-stats"></span></div>
@@ -201,6 +272,8 @@
     hintsEl = root.querySelector('.gx-hints');
     statsEl = root.querySelector('.gx-stats');
     keymapEl = root.querySelector('#gridx-keymap');
+    const siteCell = root.querySelector('.gx-km-site');
+    if (siteCell) siteCell.textContent = SITE ? SITE.label : 'unsupported';
     fatalEl = root.querySelector('#gridx-fatal');
 
     filterInput.addEventListener('input', () => setKeywordFilter(previewTerms(), true));
@@ -225,12 +298,15 @@
    * ------------------------------------------------------------------ */
   function isStreamHost(el) {
     if (!isEl(el) || selNotHost(el)) return false;
-    const kids = Array.from(el.children);
+    // Separators (Reddit puts an <hr> between every entry) are not content and
+    // must not dilute the ratio below: shreddit-feed is 28 posts among 70
+    // children, which would otherwise fail a naive 50% test.
+    const kids = Array.from(el.children).filter((k) => !(FILLER && k.matches && k.matches(FILLER)));
     if (kids.length < 3) return false;
     let withArticle = 0;
     for (const k of kids) {
-      // A child may be the tweet itself (fixture) or a wrapper that CONTAINS
-      // one (X's [data-testid="cellInnerDiv"]). Check both.
+      // A child may be the post itself (fixture, Reddit ads) or a wrapper that
+      // CONTAINS one (X's [data-testid="cellInnerDiv"], Reddit's <article>).
       if (k.matches && k.matches(ARTICLE)) withArticle++;
       else if (k.querySelector && k.querySelector(ARTICLE)) withArticle++;
     }
@@ -271,14 +347,22 @@
     setInline('alignItems', 'start');
     setInline('columnGap', gap + 'px');
     setInline('rowGap', gap + 'px');
-    setInline('overflowY', 'auto');
-    setInline('overflowX', 'hidden');
-    setInline('overscrollBehavior', 'contain');
-    setInline('scrollBehavior', 'auto');
-    // Make sure the grid has room to scroll within the viewport. If the host
-    // is already a scroller (real X), leave its height alone; otherwise (e.g.
-    // the flat fixture `#stream`) constrain it so vertical scrolling works.
-    if (host.scrollHeight <= host.clientHeight) setInline('height', '100vh');
+    // Only take over scrolling on sites whose feed container is the scroller.
+    // Reddit scrolls the document: turning shreddit-feed into its own scroller
+    // strands Reddit's infinite-scroll sentinel and kills pagination, so we
+    // leave the page's native scroll model alone there.
+    if (SITE && SITE.ownScroller) {
+      setInline('overflowY', 'auto');
+      setInline('overflowX', 'hidden');
+      setInline('overscrollBehavior', 'contain');
+      setInline('scrollBehavior', 'auto');
+      // Make sure the grid has room to scroll within the viewport. If the host
+      // is already a scroller (real X), leave its height alone; otherwise (e.g.
+      // the flat fixture `#stream`) constrain it so vertical scrolling works.
+      if (host.scrollHeight <= host.clientHeight) setInline('height', '100vh');
+    } else {
+      setInline('overflowX', 'hidden');
+    }
 
     // Density / font-scale as CSS vars cascading into articles.
     const fs = clampNum(settings.fontScale, 0.8, 1.4);
@@ -320,8 +404,8 @@
    * ------------------------------------------------------------------ */
   function markArticle(a) {
     if (!a.dataset.gxUrl) {
-      const link = a.querySelector(STATUS_LINK);
-      if (link) a.dataset.gxUrl = link.href;
+      const url = SITE ? SITE.permalink(a) : '';
+      if (url) a.dataset.gxUrl = url;
     }
   }
 
@@ -329,9 +413,9 @@
     return host ? Array.from(host.querySelectorAll(ARTICLE)) : [];
   }
 
-  function isSponsor(a) { return !!a.querySelector(S.sponsored.join(', ')); }
-  function isRetweeted(a) { return /reposted/i.test(a.innerText || ''); }
-  function isVerified(a) { return !!a.querySelector(S.verified.join(', ')); }
+  function isSponsor(a) { try { return !!SITE.sponsored(a); } catch (e) { return false; } }
+  function isRetweeted(a) { try { return !!SITE.repost(a); } catch (e) { return false; } }
+  function isVerified(a) { try { return !!SITE.verified(a); } catch (e) { return false; } }
 
   function termHides(text, terms) {
     for (const raw of terms || []) {
@@ -357,6 +441,9 @@
         (settings.hideVerified && isVerified(a));
       const hide = kw || hf || catHide;
       a.classList.toggle('gx-hidden', hide);
+      // Hiding only the inner post would leave its wrapper occupying a cell.
+      const cell = cellOf(a);
+      if (cell !== a) cell.classList.toggle('gx-hidden', hide);
       if (hide) hidden++;
     }
     stats.postsFiltered = hidden;
@@ -397,9 +484,7 @@
     if (interactive) return;
     const art = e.target.closest(ARTICLE);
     if (!art) return;
-    const url = art.dataset.gxUrl || (() => {
-      const l = art.querySelector(STATUS_LINK); return l ? l.href : '';
-    })();
+    const url = art.dataset.gxUrl || (SITE ? SITE.permalink(art) : '');
     if (!url) return;
     e.preventDefault();
     openTab(url);
@@ -437,13 +522,15 @@
     }
     active = true;
     document.documentElement.classList.add(CLASS_ACTIVE);
+    document.documentElement.classList.add('gridx-site-' + SITE.id);
     savedStyles = {};
     applyGrid();
     recomputeFilters();
+    wireObserver();
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKeydown, true);
     startStats();
-    setStatus('GridX active');
+    setStatus('GridX active on ' + (SITE ? SITE.label : 'this site'));
     log('activated on', host);
   }
 
@@ -469,6 +556,7 @@
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKeydown, true);
     document.documentElement.classList.remove(CLASS_ACTIVE, CLASS_SCAN);
+    for (const s of SITES) document.documentElement.classList.remove('gridx-site-' + s.id);
     replantAll();
     active = false;
     cursorArticle = null;
@@ -635,7 +723,10 @@
     const i = idx(cursorArticle);
     focus(l[i < 0 ? 0 : Math.max(0, Math.min(l.length - 1, i + delta))]);
   }
-  function scrollBy(f) { if (host) host.scrollTop += f * (host.clientHeight || 900); }
+  function scrollBy(f) {
+    if (host && SITE && SITE.ownScroller) { host.scrollTop += f * (host.clientHeight || 900); return; }
+    window.scrollBy(0, f * (window.innerHeight || 900));
+  }
   function openCursor(sameTab) {
     const a = cursorArticle;
     const url = a ? (a.dataset.gxUrl || '') : '';
@@ -699,6 +790,8 @@
    * Boot
    * ------------------------------------------------------------------ */
   async function init() {
+    // No adapter for this host: do nothing at all, leave the page untouched.
+    if (!SITE) return;
     await loadCounters();
     await loadSettings();
     registerMessaging();

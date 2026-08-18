@@ -18,10 +18,15 @@
  * internals — that was the source of overlap.
  * ========================================================================== */
 
-/* --- Page-level: kill body scroll while the grid owns the tab. ----------- */
+/* --- Page-level: kill body scroll ONLY where the feed container is itself
+   the scroller (X). Reddit scrolls the document, so locking overflow there
+   freezes the page and strands its infinite-scroll sentinel. --------------- */
 html.gridx-active,
 html.gridx-active body {
   scroll-behavior: auto !important;
+}
+html.gridx-active.gridx-site-x,
+html.gridx-active.gridx-site-x body {
   overflow: hidden !important;
 }
 
@@ -87,6 +92,67 @@ html.gridx-scan .gx-stream [data-testid="videoPlayer"] { display: none !importan
 
 html.gridx-active.gx-hide-metrics .gx-stream [role="group"],
 html.gridx-scan .gx-stream [role="group"] { display: none !important; }
+
+/* ===========================================================================
+ * Reddit (shreddit + old.reddit). Same model as X: we only restyle Reddit's
+ * own feed container and never move a node.
+ * ========================================================================== */
+
+/* Separators between entries would each occupy their own grid cell. */
+.gx-stream > hr { display: none !important; }
+
+/* Reddit's post wrapper and the custom element must not force a min width
+   wider than the column, or the grid overflows horizontally. */
+.gx-stream > article,
+.gx-stream shreddit-post,
+.gx-stream shreddit-ad-post,
+.gx-stream .thing.link {
+  min-width: 0 !important;
+  max-width: 100% !important;
+  box-sizing: border-box;
+}
+
+/* Reddit caps the feed column and reserves rails on both sides; reclaim the
+   width. Hiding a rail is not enough on its own: its grid TRACK survives, so
+   the feed reflows into the leftover narrow column (measured: 68px columns).
+   The container must be told to span every track. */
+html.gridx-active #subgrid-container,
+html.gridx-active .subgrid-container,
+html.gridx-active .main-container,
+html.gridx-active #main-content,
+html.gridx-active main {
+  grid-column: 1 / -1 !important;
+  grid-area: auto !important;
+  max-width: none !important;
+  width: 100% !important;
+}
+html.gridx-active #right-sidebar-container,
+html.gridx-active aside[aria-label="Recent Posts"],
+html.gridx-active reddit-sidebar-nav,
+html.gridx-active #left-sidebar { display: none !important; }
+/* With the rails gone the parent grid should not keep reserving their tracks. */
+html.gridx-active .grid-container { grid-template-columns: minmax(0, 1fr) !important; }
+
+/* Feature toggles mapped onto Reddit's markup. */
+html.gridx-active.gx-hide-avatar .gx-stream shreddit-post img[src*="avatar"],
+html.gridx-active.gx-hide-avatar .gx-stream faceplate-img[loading],
+html.gridx-scan .gx-stream shreddit-post img[src*="avatar"] { display: none !important; }
+
+html.gridx-active.gx-hide-media .gx-stream shreddit-aspect-ratio,
+html.gridx-active.gx-hide-media .gx-stream shreddit-media-lightbox-listener,
+html.gridx-active.gx-hide-media .gx-stream [slot="thumbnail"],
+html.gridx-active.gx-hide-media .gx-stream .thing.link .thumbnail,
+html.gridx-scan .gx-stream shreddit-aspect-ratio,
+html.gridx-scan .gx-stream [slot="thumbnail"] { display: none !important; }
+
+html.gridx-active.gx-hide-metrics .gx-stream shreddit-post-flair,
+html.gridx-active.gx-hide-metrics .gx-stream [slot="post-media-container"] ~ div,
+html.gridx-active.gx-hide-metrics .gx-stream .thing.link .buttons,
+html.gridx-scan .gx-stream .thing.link .buttons { display: none !important; }
+
+/* old.reddit lays posts out in a table-ish flow; neutralize the float. */
+.gx-stream .thing.link { float: none !important; display: block !important; }
+
 
 /* --- Kill X animation on the grid path (fast scanning). ------------------ */
 html.gridx-active .gx-stream,

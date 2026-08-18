@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "GridX — High-Density X Dashboard",
-  "version": "0.2.0",
-  "description": "Turn the live X (twitter.com) app into a high-density, multi-column grid dashboard for scanning dozens of posts at once.",
+  "name": "GridX - High-Density Feed Dashboard",
+  "version": "0.3.0",
+  "description": "Turn X and Reddit into a high-density, multi-column grid dashboard for scanning dozens of posts at once.",
   "permissions": [
     "storage"
   ],
@@ -11,6 +11,9 @@
       "matches": [
         "https://x.com/*",
         "https://twitter.com/*",
+        "https://www.reddit.com/*",
+        "https://reddit.com/*",
+        "https://old.reddit.com/*",
         "http://localhost/*",
         "http://127.0.0.1/*"
       ],
@@ -24,7 +27,7 @@
     }
   ],
   "action": {
-    "default_title": "GridX — High-Density X Dashboard",
+    "default_title": "GridX - High-Density Feed Dashboard",
     "default_popup": "src/popup/popup.html",
     "default_icon": {
       "16": "icons/icon16.png",

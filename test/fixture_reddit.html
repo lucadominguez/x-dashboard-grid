@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en" data-gridx-site="reddit">
+<head>
+<meta charset="utf-8">
+<title>Reddit fixture - GridX</title>
+<!--
+  Structural replica of live www.reddit.com, captured 2026-08-17:
+    shreddit-feed
+      > article.w-full.m-0 > shreddit-post[permalink][post-title][author]...
+      > hr                          (separator between every entry)
+      > shreddit-ad-post            (ads are NOT wrapped in <article>)
+  The document owns the scroll, exactly as on Reddit, and a sentinel at the
+  bottom appends the next page the way Reddit's infinite scroll does. This is
+  what lets the suite verify pagination still works once GridX columnizes.
+-->
+<style>
+  :root { color-scheme: light; }
+  body { margin:0; font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; background:#f6f7f8; }
+  header { position:sticky; top:0; height:48px; background:#fff; border-bottom:1px solid #ddd; display:flex; align-items:center; padding:0 12px; z-index:5; }
+  .grid-container { display:grid; grid-template-columns: 240px minmax(0,1fr); gap:16px; }
+  #left-sidebar { padding:12px; }
+  .subgrid-container { max-width: 760px; box-sizing:border-box; padding:12px; }
+  shreddit-feed { display:block; }
+  article { display:block; margin:0 0 8px; }
+  shreddit-post, shreddit-ad-post {
+    display:block; background:#fff; border:1px solid #ccc; border-radius:8px; padding:10px; margin-bottom:8px;
+    min-height:120px; box-sizing:border-box;
+  }
+  .pt { font-weight:600; margin:2px 0 6px; }
+  .meta { color:#777; font-size:12px; }
+  .thumb { display:block; width:100%; height:110px; background:linear-gradient(135deg,#cfd9df,#a1c4fd); border-radius:6px; margin:8px 0; }
+  .buttons { display:flex; gap:10px; color:#777; font-size:12px; margin-top:6px; }
+  a { color:#0079d3; text-decoration:none; }
+  hr { border:0; border-top:1px solid #e2e2e2; margin:8px 0; }
+  #right-sidebar-container { display:none; }
+  #sentinel { height:24px; }
+</style>
+</head>
+<body>
+<header><strong>reddit-fixture</strong></header>
+<div class="grid-container">
+  <div id="left-sidebar">nav</div>
+  <div class="subgrid-container">
+    <main id="main-content">
+      <shreddit-feed></shreddit-feed>
+      <div id="sentinel"></div>
+    </main>
+  </div>
+</div>
+
+<script>
+const SUBS = ['programming','AskReddit','science','webdev','todayilearned','space'];
+const WORDS = ['kubernetes','harbour','printing','glacier','protocol','sandwich','telescope','archive',
+               'compiler','mycology','bicycle','notation','plumbing','asteroid','ferment','lantern'];
+let n = 0;
+
+function makePost(i) {
+  const sub = SUBS[i % SUBS.length];
+  const title = WORDS[i % WORDS.length] + ' ' + WORDS[(i * 7 + 3) % WORDS.length] +
+                ' thread number ' + i;
+  const permalink = '/r/' + sub + '/comments/' + (1000000 + i) + '/' +
+                    title.toLowerCase().replace(/\s+/g, '_') + '/';
+  const p = document.createElement('shreddit-post');
+  p.setAttribute('permalink', permalink);
+  p.setAttribute('post-title', title);
+  p.setAttribute('author', 'user_' + i);
+  p.setAttribute('subreddit-prefixed-name', 'r/' + sub);
+  p.setAttribute('score', String(50 + (i * 37) % 4000));
+  p.setAttribute('comment-count', String((i * 13) % 700));
+  p.setAttribute('id', 't3_' + (1000000 + i));
+  p.setAttribute('post-type', i % 3 === 0 ? 'image' : 'text');
+  p.innerHTML =
+    '<div class="meta">r/' + sub + ' &middot; u/user_' + i + ' &middot; 3 hr. ago</div>' +
+    '<div class="pt"><a href="' + permalink + '">' + title + '</a></div>' +
+    (i % 3 === 0 ? '<span slot="thumbnail" class="thumb"></span>' : '') +
+    '<div class="buttons"><span>' + ((i * 13) % 700) + ' comments</span><span>share</span></div>';
+  const art = document.createElement('article');
+  art.className = 'w-full m-0';
+  art.appendChild(p);
+  return art;
+}
+
+function makeAd(i) {
+  const ad = document.createElement('shreddit-ad-post');
+  ad.setAttribute('promoted', '');
+  ad.setAttribute('permalink', '/r/ads/comments/' + (9000000 + i) + '/sponsored_' + i + '/');
+  ad.innerHTML = '<div class="meta">promoted</div><div class="pt">Sponsored placement ' + i + '</div>';
+  return ad;
+}
+
+function appendPage(count) {
+  const feed = document.querySelector('shreddit-feed');
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < count; i++, n++) {
+    frag.appendChild(n % 9 === 8 ? makeAd(n) : makePost(n));
+    frag.appendChild(document.createElement('hr'));
+  }
+  feed.appendChild(frag);
+}
+
+appendPage(40);
+
+// Reddit-style infinite scroll. IntersectionObserver only fires on state
+// TRANSITIONS, so after appending we move the sentinel to the end and re-arm
+// it; otherwise a sentinel that stays intersecting never fires again and the
+// feed silently stops paginating.
+const sentinel = document.getElementById('sentinel');
+const io = new IntersectionObserver((entries) => {
+  for (const e of entries) {
+    if (!e.isIntersecting || n >= 400) continue;
+    appendPage(12);
+    document.getElementById('main-content').appendChild(sentinel);
+    io.unobserve(sentinel);
+    requestAnimationFrame(() => io.observe(sentinel));
+  }
+}, { rootMargin: '300px' });
+io.observe(sentinel);
+</script>
+</body>
+</html>
