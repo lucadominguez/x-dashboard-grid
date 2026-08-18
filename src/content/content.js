@@ -561,6 +561,53 @@
   function detachObserver() { if (observer) { observer.disconnect(); observer = null; } }
 
   /* ------------------------------------------------------------------ *
+   * Health watchdog.
+   *
+   * The MutationObserver is attached to the feed container. If the site
+   * REPLACES that container - which every SPA navigation on X does - the node
+   * we hold detaches, and a detached node emits no mutations ever again. The
+   * observer can therefore never notice its own death, and the grid silently
+   * stops working until a reload. This poll is the only thing that can catch
+   * that, so it stays cheap: an isConnected check and a computed-style read.
+   * ------------------------------------------------------------------ */
+  let healthTimer = null;
+  let lastHref = location.href;
+
+  function startHealth() {
+    stopHealth();
+    healthTimer = setInterval(() => {
+      if (!active || paused) return;
+
+      if (location.href !== lastHref) {
+        lastHref = location.href;
+        if (cursorArticle) { cursorArticle.classList.remove('gx-cursor'); cursorArticle = null; }
+        invalidateList();
+      }
+
+      // Feed container replaced or removed: re-resolve and re-apply.
+      if (!host || !host.isConnected) {
+        const next = findHost();
+        if (next) {
+          detachObserver();
+          host = next;
+          savedStyles = {};
+          applyGrid();
+          wireObserver();
+          recomputeFilters();
+          log('reattached to a new feed container');
+        }
+        return;
+      }
+
+      // Still our container, but the site re-rendered and clobbered the grid.
+      let disp = '';
+      try { disp = getComputedStyle(host).display; } catch (e) { return; }
+      if (disp !== 'grid') { applyGrid(); recomputeFilters(); log('grid reapplied'); }
+    }, 1500);
+  }
+  function stopHealth() { if (healthTimer) { clearInterval(healthTimer); healthTimer = null; } }
+
+  /* ------------------------------------------------------------------ *
    * Click-to-open: user asked clicks on a post open the REAL post in a new
    * tab. We only act when the click is not on a native link/interactive
    * control, and we open via a real <a> so it is a genuine user gesture.
@@ -618,6 +665,7 @@
     applyGrid();
     recomputeFilters();
     wireObserver();
+    startHealth();
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKeydown, true);
     startStats();
@@ -642,6 +690,7 @@
   function deactivate() {
     if (!active) return;
     detachObserver();
+    stopHealth();
     stopStats();
     restoreHost();
     document.removeEventListener('click', onClick, true);
