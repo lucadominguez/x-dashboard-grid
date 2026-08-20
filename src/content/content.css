@@ -269,7 +269,12 @@ html.gridx-active .gx-expanded [data-testid="tweetText"] { display: block !impor
 }
 html.gridx-active .gx-stream > *:hover > .gx-expand,
 .gx-expand:focus-visible { opacity: 1; }
-html.gridx-active .gx-stream > * { position: relative; }
+/* The button needs a positioned cell to sit in, but this must NEVER be applied
+   blindly: on x.com the cells are absolutely positioned by the site's
+   virtualizer, and forcing them to `relative` is precisely the unvirtualize
+   that stops X mounting posts. Only take cells that are already in flow. */
+html.gridx-active.gridx-site-reddit .gx-stream > *,
+html.gridx-active.gx-unvirtualized .gx-stream > * { position: relative; }
 
 /* --- Narrow columns: keep the action row inside the cell. ----------------
    At six columns on a 1280px viewport a cell is ~197px and the vote / comment
@@ -280,7 +285,10 @@ html.gridx-active .gx-stream > * { position: relative; }
    itself. Container queries make it self-tuning: the scale keys off the cell's
    own width, so it engages exactly when the column is too narrow and never
    when it is not, at any column count or window size. */
-html.gridx-active .gx-stream > * { container-type: inline-size; }
+/* Same caution: inline-size containment makes an element's inline size
+   independent of its contents, which on an auto-width absolutely positioned
+   cell collapses it. Reddit's cells are in normal flow, so scope it there. */
+html.gridx-active.gridx-site-reddit .gx-stream > * { container-type: inline-size; }
 
 /* X: light DOM, so shrink rather than scale - no text-size cost. */
 html.gridx-active .gx-stream [role="group"],
