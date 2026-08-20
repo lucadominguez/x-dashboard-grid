@@ -106,6 +106,9 @@
       // and centres MAIN's single flex child. Hiding the rails does not lift
       // either, so the whole ancestor chain has to be widened by hand.
       widenChain: true,
+      // A grid of one post is not a grid. /status/ is the permalink view and
+      // /i/ covers the photo and modal routes X opens on top of it.
+      feedRoute: (p) => !/\/status\/\d+/.test(p) && !/^\/i\//.test(p),
       permalink: (el) => { const l = el.querySelector('a[href*="/status/"]'); return l ? l.href : ''; },
       sponsored: (el) => !!el.querySelector('a[aria-label*="sponsored"]'),
       repost: (el) => /reposted/i.test(el.textContent || ''),
@@ -130,6 +133,8 @@
       ownScroller: false,
       // Reddit's own rails are hidden in CSS; no ancestor cap to lift.
       widenChain: false,
+      // /comments/ is Reddit's single-post view on both new and old.
+      feedRoute: (p) => !/\/comments\//.test(p),
       permalink: (el) => {
         const a = el.getAttribute && (el.getAttribute('permalink') || el.getAttribute('data-permalink'));
         if (a) { try { return new URL(a, location.origin).href; } catch (e) {} }
@@ -449,6 +454,10 @@
     // apply and visibly does nothing. Detect that and put the cells back in
     // flow so the grid can actually place them.
     if (detectOutOfFlow()) setTimeout(verifyUnvirtualize, 400);
+    // Tiny implicit rows are what let a cell span exactly its own height.
+    setInline('gridAutoRows', ROW_UNIT + 'px');
+    scheduleMasonry();
+    stats.effectiveColumns = measureColumns();
     applyScanClass();
   }
 
@@ -457,11 +466,28 @@
   // pages by scroll offset, removing it can leave the page unable to scroll at
   // all - which is strictly worse than no grid. Verify, and back out if so.
   let unvirtBlocked = false;
+  // Once a feed has proved it cannot be gridded, stay off it. Without this the
+  // health watchdog and the route watcher both cheerfully re-activate and the
+  // whole cycle runs again on every navigation.
+  let virtualizedGiveUp = false;
+
   function revertUnvirtualize(reason) {
     document.documentElement.classList.remove(CLASS_UNVIRT);
     unvirtBlocked = true;
-    setStatus('GridX: this feed is virtualized, keeping the site layout', 6000);
     log('unvirtualize reverted:', reason);
+    // Backing out of the unvirtualize alone left the worst of both worlds: the
+    // cells go back to being absolutely positioned so the grid does nothing,
+    // but the feed KEEPS the width we reclaimed for it - which on x.com means
+    // a single column of posts stretched across the whole 1248px window,
+    // measurably worse to read than the site's own centred column. If we
+    // cannot grid the feed we have no business restyling it either, so stand
+    // all the way down and say so plainly.
+    virtualizedGiveUp = true;
+    const label = SITE ? SITE.label : 'this site';
+    deactivate();
+    showFatal('GridX cannot grid ' + label + "'s timeline: the site renders it "
+      + 'virtualized, and its own loader stops feeding posts when the grid takes '
+      + 'over placement. Leaving the site layout untouched.');
   }
 
   function verifyUnvirtualize() {
@@ -533,6 +559,24 @@
     return outOfFlow;
   }
 
+  // The status readout used to print the CONFIGURED column count, so it happily
+  // claimed "cols 8" while every post sat full width in a single column. Count
+  // the distinct left edges instead: that is what the reader can actually see.
+  function measureColumns() {
+    if (!host) return 0;
+    const xs = new Set();
+    let n = 0;
+    for (const cell of host.children) {
+      if (!isEl(cell) || n >= 12) break;
+      if (FILLER && cell.matches && cell.matches(FILLER)) continue;
+      try {
+        const r = cell.getBoundingClientRect();
+        if (r.width > 0) { xs.add(Math.round(r.left)); n++; }
+      } catch (e) {}
+    }
+    return xs.size;
+  }
+
   function densityScale() {
     return { compact: 1, cozy: 1.35, roomy: 1.75 }[settings.density] || 1;
   }
@@ -565,6 +609,75 @@
 
   function articles() {
     return host ? Array.from(host.querySelectorAll(ARTICLE)) : [];
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Masonry packing.
+   *
+   * A plain CSS grid makes every row as tall as its tallest cell, so one post
+   * with a large image leaves a column-wide hole beside it - measured on live
+   * x.com, a 1130px post sat next to a 161px post and cost ~970px of dead
+   * space in a single row. The fix is the row-span trick: make the row track
+   * tiny and give each cell a span equal to its own height in track units, so
+   * cells pack against whatever is above them instead of against a shared row
+   * line. `align-items: start` is what makes this measurable - without it the
+   * grid would stretch each cell to its span and every height would read back
+   * as the track height rather than the content height.
+   * ------------------------------------------------------------------ */
+  const ROW_UNIT = 4; // px per implicit row track
+
+  let masonryQueued = false;
+  function scheduleMasonry() {
+    if (masonryQueued || !active) return;
+    masonryQueued = true;
+    requestAnimationFrame(() => { masonryQueued = false; layoutMasonry(); });
+  }
+
+  function layoutMasonry() {
+    if (!active || !host) return;
+    // Only meaningful while we own the layout as a grid.
+    let gap = 0;
+    try {
+      if (getComputedStyle(host).display !== 'grid') return;
+      gap = parseFloat(getComputedStyle(host).rowGap) || 0;
+    } catch (e) { return; }
+    for (const cell of host.children) {
+      if (!isEl(cell)) continue;
+      if (FILLER && cell.matches && cell.matches(FILLER)) continue;
+      stats.effectiveColumns = stats.effectiveColumns || 0;
+      let h = 0;
+      try { h = cell.getBoundingClientRect().height; } catch (e) { continue; }
+      if (!h) { cell.style.removeProperty('grid-row-end'); continue; }
+      const span = Math.max(1, Math.ceil((h + gap) / ROW_UNIT));
+      const want = 'span ' + span;
+      // Writing an unchanged value still dirties layout; skip the no-ops.
+      if (cell.style.gridRowEnd !== want) cell.style.gridRowEnd = want;
+    }
+    stats.effectiveColumns = measureColumns();
+  }
+
+  function clearMasonry() {
+    if (!host) return;
+    for (const cell of host.children) {
+      if (isEl(cell)) cell.style.removeProperty('grid-row-end');
+    }
+  }
+
+  // Cells grow after the fact: images decode, embeds resize, "Show more"
+  // expands a post. Without watching for that the spans are computed against
+  // a height that is already stale and the packing drifts apart.
+  let sizeObserver = null;
+  function wireSizeObserver() {
+    if (typeof ResizeObserver === 'undefined') return;
+    if (sizeObserver) sizeObserver.disconnect();
+    sizeObserver = new ResizeObserver(() => scheduleMasonry());
+    for (const cell of host.children) {
+      if (isEl(cell)) { try { sizeObserver.observe(cell); } catch (e) {} }
+    }
+  }
+
+  function detachSizeObserver() {
+    if (sizeObserver) { sizeObserver.disconnect(); sizeObserver = null; }
   }
 
   function isSponsor(a) { try { return !!SITE.sponsored(a); } catch (e) { return false; } }
@@ -708,6 +821,8 @@
           }
         }
         recomputeFilters();
+        wireSizeObserver();
+        scheduleMasonry();
       });
     });
     observer.observe(host, { childList: true, subtree: true });
@@ -769,6 +884,13 @@
   function onClick(e) {
     if (paused) return;
     if (e.defaultPrevented) return;
+    const expander = e.target.closest && e.target.closest('.gx-expand');
+    if (expander && expander.parentElement) {
+      e.preventDefault();
+      e.stopPropagation();
+      onExpandClick(expander.parentElement);
+      return;
+    }
     // Let X handle links, buttons, media controls, inputs natively.
     const interactive = e.target.closest(
       'a, [role="link"], [role="button"], button, [tabindex], input, textarea, video, audio, img, select'
@@ -780,6 +902,88 @@
     if (!url) return;
     e.preventDefault();
     openTab(url);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Expand affordance.
+   *
+   * Both sites clamp post text, and a narrow column clamps it harder, so posts
+   * read as truncated with no way to see the rest without leaving the grid.
+   * The button is injected on first hover of a cell rather than for every cell
+   * up front: a busy feed carries hundreds of cells and only the one under the
+   * pointer needs the control.
+   * ------------------------------------------------------------------ */
+  function onCellHover(e) {
+    if (!active || !host) return;
+    const t = e.target;
+    if (!t || !t.closest) return;
+    const cell = t.closest('.gx-stream > *');
+    if (!cell || cell.parentElement !== host) return;
+    if (FILLER && cell.matches && cell.matches(FILLER)) return;
+    if (cell.querySelector(':scope > .gx-expand')) return;
+    const btn = document.createElement('button');
+    btn.className = 'gx-expand';
+    btn.type = 'button';
+    btn.title = 'Show the full post (e)';
+    btn.setAttribute('aria-label', 'Show the full post');
+    btn.textContent = '⇲';
+    cell.appendChild(btn);
+  }
+
+  function onExpandClick(cell) {
+    const on = cell.classList.toggle('gx-expanded');
+    const post = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE);
+    if (post) post.classList.toggle('gx-expanded', on);
+    const btn = cell.querySelector(':scope > .gx-expand');
+    if (btn) btn.textContent = on ? '⇱' : '⇲';
+    scheduleMasonry();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Route awareness.
+   *
+   * These are single-page apps: opening a post swaps the timeline for one
+   * post without a page load, so the content script never re-runs and the grid
+   * kept applying to the permalink view. Watch the URL and stand down there.
+   * ------------------------------------------------------------------ */
+  function isFeedRoute() {
+    if (!SITE || !SITE.feedRoute) return true;
+    try { return !!SITE.feedRoute(location.pathname); } catch (e) { return true; }
+  }
+
+  // Tracks whether WE stood the grid down for the route, so returning to a feed
+  // only revives a grid the route turned off - never one the user switched off.
+  let standDown = false;
+  let routeHref = location.href;
+  let routeTimer = null;
+  function startRouteWatch() {
+    if (routeTimer) return;
+    routeTimer = setInterval(() => {
+      if (location.href === routeHref) return;
+      routeHref = location.href;
+      onRouteChange();
+    }, 400);
+  }
+
+  function stopRouteWatch() {
+    if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
+  }
+
+  function onRouteChange() {
+    if (!isFeedRoute()) {
+      if (active) {
+        standDown = true;
+        deactivate();
+        setStatus('GridX stands down on a single post', 4000);
+      }
+      return;
+    }
+    if (!active && standDown) {
+      // The feed is rebuilt from scratch on the way back; give it a beat.
+      setTimeout(() => {
+        if (!active && standDown && isFeedRoute()) { standDown = false; activate(); }
+      }, 500);
+    }
   }
 
   function openTab(url) {
@@ -804,6 +1008,7 @@
   let retryTimer = null;
   function activate() {
     if (active) return;
+    if (virtualizedGiveUp) return;
     ensureOverlay();
     hideFatal();
     host = findHost();
@@ -823,9 +1028,13 @@
     applyGrid();
     recomputeFilters();
     wireObserver();
+    wireSizeObserver();
+    scheduleMasonry();
+    window.addEventListener('resize', scheduleMasonry, { passive: true });
     startHealth();
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKeydown, true);
+    document.addEventListener('mouseover', onCellHover, true);
     startStats();
     setStatus('GridX active on ' + (SITE ? SITE.label : 'this site'));
     log('activated on', host);
@@ -845,16 +1054,27 @@
     }, 1500);
   }
 
+  // A deliberate toggle from the popup or the keyboard clears the give-up flag:
+  // the user asking for the grid again is the one signal that should override
+  // our own decision to stay off.
+  function resetGiveUp() { virtualizedGiveUp = false; unvirtBlocked = false; }
+
   function deactivate() {
     if (!active) return;
     detachObserver();
     stopHealth();
     stopStats();
     stopPaginationWatch();
+    detachSizeObserver();
+    window.removeEventListener('resize', scheduleMasonry);
+    clearMasonry();
     untagWidenChain();
     restoreHost();
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKeydown, true);
+    document.removeEventListener('mouseover', onCellHover, true);
+    for (const b of document.querySelectorAll('.gx-expand')) b.remove();
+    for (const c of document.querySelectorAll('.gx-expanded')) c.classList.remove('gx-expanded');
     document.documentElement.classList.remove(CLASS_ACTIVE, CLASS_SCAN);
     for (const s of SITES) document.documentElement.classList.remove('gridx-site-' + s.id);
     document.documentElement.classList.remove(CLASS_UNVIRT, CLASS_LOCK);
@@ -909,7 +1129,7 @@
     statsEl.textContent =
       'posts ' + stats.postsRendered +
       ' · hidden ' + stats.postsFiltered +
-      ' · cols ' + stats.columnCount +
+      ' · cols ' + (stats.effectiveColumns || stats.columnCount) +
       ' · up ' + fmtTime(stats.gridActiveMs) +
       (paused ? ' · paused' : '') +
       (settings.scanMode ? ' · scan' : '');
@@ -974,7 +1194,9 @@
   }
 
   function handleCommand(cmd) {
-    if (cmd === 'toggle-grid') { if (active) deactivate(); else activate(); }
+    // Asking for the grid by hand overrides our own decision to stay off a
+    // feed we judged un-griddable, so the user always gets the last word.
+    if (cmd === 'toggle-grid') { if (active) deactivate(); else { resetGiveUp(); hideFatal(); activate(); } }
     else if (cmd === 'toggle-pause') togglePause();
     else if (cmd === 'toggle-scan') toggleScan();
   }
@@ -1015,6 +1237,35 @@
    * ------------------------------------------------------------------ */
   const isEditable = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
 
+  // ...but e.target is RETARGETED at a shadow boundary. Type in Reddit's search
+  // box and the event reports <faceplate-search-input>, not the <input> inside
+  // it, so the check above saw a non-editable element and GridX swallowed the
+  // keystroke - which is why 's' (and f, p, j, k, o...) went missing mid-search.
+  // composedPath is the only view of the event that crosses shadow roots.
+  function editableLike(t) {
+    if (!t || t.nodeType !== 1) return false;
+    const tag = t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (t.isContentEditable) return true;
+    const role = t.getAttribute && t.getAttribute('role');
+    return role === 'textbox' || role === 'searchbox' || role === 'combobox';
+  }
+
+  function deepActiveElement() {
+    let el = document.activeElement;
+    let hops = 0;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement && hops++ < 10) {
+      el = el.shadowRoot.activeElement;
+    }
+    return el;
+  }
+
+  function inTypingContext(e) {
+    const path = (e.composedPath && e.composedPath()) || [];
+    for (const n of path) if (editableLike(n)) return true;
+    return editableLike(deepActiveElement()) || editableLike(e.target);
+  }
+
   // Cached because every cursor move used to rebuild it: a full querySelectorAll
   // plus a filter across the whole feed, per keypress. Invalidated whenever the
   // post set or the hidden set changes.
@@ -1054,7 +1305,17 @@
     if (!url) { setStatus('no post under cursor'); return; }
     if (sameTab) window.location.href = url; else openTab(url);
   }
-  function toggleCursor() { if (cursorArticle) cursorArticle.classList.toggle('gx-expanded'); }
+  // Expand the post under the cursor. This used to toggle a class that no
+  // stylesheet responded to, so the key did nothing at all; the class now
+  // un-clamps the text and the cell grows to fit. Toggling the CELL (not the
+  // post) is what lets the box itself grow inside the grid.
+  function toggleCursor() {
+    if (!cursorArticle) { setStatus('no post under cursor'); return; }
+    const cell = cellOf(cursorArticle);
+    const on = cell.classList.toggle('gx-expanded');
+    cursorArticle.classList.toggle('gx-expanded', on);
+    scheduleMasonry();
+  }
   function toggleKeymap() { if (keymapEl) keymapEl.hidden = !keymapEl.hidden; }
   function clearCursorOrClose() {
     if (keymapEl && !keymapEl.hidden) { keymapEl.hidden = true; return; }
@@ -1063,8 +1324,10 @@
 
   function onKeydown(e) {
     if (e.defaultPrevented) return;
+    // Never fight a browser or site chord: Ctrl/Cmd/Alt combinations are not ours.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     const t = e.target;
-    if (isEditable(t)) {
+    if (inTypingContext(e)) {
       if (t === filterInput && e.key === 'Escape') { e.preventDefault(); clearFilter('cleared filter'); }
       return;
     }
@@ -1081,7 +1344,7 @@
       case 'Enter': openCursor(false); break;
       case 'o': openCursor(true); break;
       case 'Backspace': window.history.back(); break;
-      case 'x': toggleCursor(); break;
+      case 'x': case 'e': toggleCursor(); break;
       case 'f': if (filterInput) { filterInput.focus(); filterInput.select(); } break;
       case 's': toggleScan(); break;
       case 'p': togglePause(); break;
@@ -1116,7 +1379,8 @@
     await loadCounters();
     await loadSettings();
     registerMessaging();
-    activate();
+    startRouteWatch();
+    if (isFeedRoute()) activate();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();

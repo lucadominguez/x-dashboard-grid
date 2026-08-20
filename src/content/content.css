@@ -219,6 +219,88 @@ html.gridx-active.gx-hide-metrics .gx-stream [slot="post-media-container"] ~ div
 html.gridx-active.gx-hide-metrics .gx-stream .thing.link .buttons,
 html.gridx-scan .gx-stream .thing.link .buttons { display: none !important; }
 
+/* --- Expand: show the text a narrow column hides. ------------------------
+   Both sites clamp post text, and a narrow column clamps it harder, so posts
+   read as truncated with no way to reach the rest without leaving the grid.
+   `gx-expanded` used to be toggled by the keyboard onto a class no stylesheet
+   answered, so the key silently did nothing. It now lifts every clamp we can
+   reach and drops any scale-down, and the cell re-packs around its new height. */
+html.gridx-active .gx-expanded,
+html.gridx-active .gx-expanded [class*="line-clamp"],
+html.gridx-active .gx-expanded [style*="line-clamp"],
+html.gridx-active .gx-expanded .md,
+html.gridx-active .gx-expanded [data-testid="tweetText"],
+html.gridx-active .gx-expanded p,
+html.gridx-active .gx-expanded div {
+  -webkit-line-clamp: unset !important;
+  line-clamp: unset !important;
+  max-height: none !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+}
+/* Expanded posts are read, not scanned: give them full size even in a narrow
+   column, and lift them above their neighbours while they are open. */
+html.gridx-active .gx-stream > .gx-expanded { z-index: 4; position: relative; }
+html.gridx-active .gx-stream > .gx-expanded shreddit-post,
+html.gridx-active .gx-stream > .gx-expanded shreddit-ad-post,
+html.gridx-active .gx-stream > .gx-expanded .thing.link { zoom: 1 !important; }
+/* Media stays hidden by the toggle, but expanding should never hide the text. */
+html.gridx-active .gx-expanded [data-testid="tweetText"] { display: block !important; }
+
+/* The control itself: only rendered into the cell under the pointer. */
+.gx-expand {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  z-index: 6;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 18px;
+  font-size: 12px;
+  text-align: center;
+  cursor: pointer;
+  opacity: 0;
+  color: var(--gx-fg);
+  background: var(--gx-bg);
+  border: 1px solid var(--gx-border);
+  border-radius: 6px;
+  transition: none;
+}
+html.gridx-active .gx-stream > *:hover > .gx-expand,
+.gx-expand:focus-visible { opacity: 1; }
+html.gridx-active .gx-stream > * { position: relative; }
+
+/* --- Narrow columns: keep the action row inside the cell. ----------------
+   At six columns on a 1280px viewport a cell is ~197px and the vote / comment
+   / repost / share row no longer fits, so it rendered half-drawn against the
+   cell edge. On X that row is light DOM and can simply be told to shrink. On
+   Reddit it is built inside a shadow root that no content stylesheet can
+   select into, so the only lever that crosses the boundary is scaling the post
+   itself. Container queries make it self-tuning: the scale keys off the cell's
+   own width, so it engages exactly when the column is too narrow and never
+   when it is not, at any column count or window size. */
+html.gridx-active .gx-stream > * { container-type: inline-size; }
+
+/* X: light DOM, so shrink rather than scale - no text-size cost. */
+html.gridx-active .gx-stream [role="group"],
+html.gridx-active .gx-stream [role="group"] > * { min-width: 0 !important; }
+html.gridx-active .gx-stream [role="group"] { flex-wrap: wrap !important; }
+
+@container (max-width: 340px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.92; }
+}
+@container (max-width: 290px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.84; }
+}
+@container (max-width: 230px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.74; }
+  html.gridx-active .gx-stream .thing.link { zoom: 0.82; }
+}
+
 /* Reddit pads each post 16px on both sides. Inside a grid cell that is 32px of
    a column spent on whitespace the grid gap already provides, and it is what
    pushed the action row past the cell edge: measured on live www.reddit.com at
