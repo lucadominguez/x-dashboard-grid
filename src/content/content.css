@@ -90,14 +90,39 @@ html.gridx-active {
   font-size: calc(14px * var(--gx-font-scale) * (1 - 0.08 * var(--gx-density)));
 }
 
-/* Off-screen cells skip layout and paint entirely. A long feed is thousands of
-   grid items, and laying all of them out on every scroll frame is the single
-   biggest cost the grid adds. `auto` in contain-intrinsic-size lets the browser
-   remember each cell's real height after first render, so scroll position stays
-   stable. Measured: cuts scroll long-tasks to zero on an 800-post feed. */
+/* `content-visibility: auto` used to live here as a scroll optimisation. It had
+   to go: it applies paint containment, which CLIPS anything overflowing the
+   cell - that is what cut post titles off mid-word - and it substitutes
+   contain-intrinsic-size for the real height of every off-screen cell, so every
+   cell measured exactly 220px and the height-based packing below had nothing
+   true to measure. Measured on live old.reddit: all cells reported h=220 with
+   content-visibility on, and 245/525/166/264/361/335/460 with it off. A grid
+   that packs by height cannot be built on heights the browser is faking. */
+
+/* The packing below sets grid-auto-rows to a 4px track so a cell can span
+   exactly its own height. That makes an UNMEASURED cell dangerous: with no
+   span it occupies a single 4px row, and every unmeasured cell lands on the
+   same rows. Measured on live old.reddit: with the spans cleared, all 25 posts
+   stacked on top of one another in a 100px band. This default reserves a
+   post-sized block until the real span arrives, so the worst a missed pass can
+   do is leave a gap for one frame instead of shredding the feed. */
+html.gridx-active .gx-stream > * { grid-row-end: span 55; }
+
+/* Long unbroken words (URLs, handles, "hermes's") must wrap rather than spill
+   past the cell edge, and the metadata Reddit marks `nowrap` - flair, domain,
+   subreddit - must not drag a 341px line through a 151px column. */
 html.gridx-active .gx-stream > * {
-  content-visibility: auto;
-  contain-intrinsic-size: auto 220px;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+html.gridx-active .gx-stream > * [style*="nowrap"],
+html.gridx-active .gx-stream .flairrichtext,
+html.gridx-active .gx-stream .domain,
+html.gridx-active .gx-stream .subreddit,
+html.gridx-active .gx-stream .tagline > * {
+  max-width: 100% !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
 }
 
 /* ===========================================================================

@@ -106,6 +106,9 @@
       // and centres MAIN's single flex child. Hiding the rails does not lift
       // either, so the whole ancestor chain has to be widened by hand.
       widenChain: true,
+      // Below this a post stops being readable: X's tweet layout carries an
+      // avatar gutter and an action row before a word of text is placed.
+      minColumn: 300,
       // A grid of one post is not a grid. /status/ is the permalink view and
       // /i/ covers the photo and modal routes X opens on top of it.
       feedRoute: (p) => !/\/status\/\d+/.test(p) && !/^\/i\//.test(p),
@@ -133,6 +136,9 @@
       ownScroller: false,
       // Reddit's own rails are hidden in CSS; no ancestor cap to lift.
       widenChain: false,
+      // old.reddit spends ~40px of every cell on the vote gutter before any
+      // text, and new.reddit's action row needs the rest.
+      minColumn: 250,
       // /comments/ is Reddit's single-post view on both new and old.
       feedRoute: (p) => !/\/comments\//.test(p),
       permalink: (el) => {
@@ -404,13 +410,32 @@
   /* ------------------------------------------------------------------ *
    * Host grid application
    * ------------------------------------------------------------------ */
+  // How many columns will actually READ at this width? Asking for eight columns
+  // in a 1280px window gives 151px cells, and at that width old.reddit spends
+  // 40px on the vote gutter and wraps titles two words to a line - a denser
+  // grid that conveys less, which is the opposite of the point. Honour the
+  // request only as far as the window can carry it.
+  function fittedColumns(requested) {
+    const min = (SITE && SITE.minColumn) || 200;
+    let width = 0;
+    try { width = host.getBoundingClientRect().width; } catch (e) {}
+    if (!width) return requested;
+    const gap = (settings.bleed ? 0 : 6) * densityScale();
+    const fits = Math.floor((width + gap) / (min + gap));
+    return Math.max(1, Math.min(requested, fits));
+  }
+
   function applyGrid() {
     if (!host) return;
     // Re-checked here as well as at activation: the site may not have reserved
     // its virtual height yet when we first looked, and applyGrid runs again
     // whenever the health watchdog re-attaches to a rebuilt feed.
     if (isTransformVirtualized(host)) { deactivate(); standDownVirtualized(); return; }
-    const cols = clampInt(settings.columnCount, 1, 8);
+    const requested = clampInt(settings.columnCount, 1, 8);
+    const cols = fittedColumns(requested);
+    if (cols !== requested) {
+      setStatus('GridX: ' + requested + ' columns will not read at this width, using ' + cols, 5000);
+    }
     stats.columnCount = cols;
     const gap = (settings.bleed ? 0 : 6) * densityScale();
 
@@ -423,7 +448,13 @@
     setInline('alignContent', 'start');
     setInline('alignItems', 'start');
     setInline('columnGap', gap + 'px');
-    setInline('rowGap', gap + 'px');
+    // Row gap MUST be zero while the height packing is on. The packing spans a
+    // 4px track per cell, and a row gap is inserted between EVERY track, so a
+    // 107px post spanning 29 tracks occupied 29*4 + 28*6 = 284px. That, not the
+    // packing itself, was the source of the holes down every column. The gap is
+    // instead baked into each cell's span.
+    cellGap = gap;
+    setInline('rowGap', '0px');
     // Only take over scrolling on sites whose feed container is the scroller.
     // Reddit scrolls the document: turning shreddit-feed into its own scroller
     // strands Reddit's infinite-scroll sentinel and kills pagination, so we
@@ -667,6 +698,25 @@
    * as the track height rather than the content height.
    * ------------------------------------------------------------------ */
   const ROW_UNIT = 4; // px per implicit row track
+  let cellGap = 6;    // vertical breathing room, folded into each cell's span
+
+  // A narrower window may no longer carry the column count we picked, so the fit
+  // has to be recomputed before the cells are re-packed against it.
+  let resizeQueued = false;
+  function onViewportResize() {
+    if (resizeQueued || !active) return;
+    resizeQueued = true;
+    requestAnimationFrame(() => {
+      resizeQueued = false;
+      if (!active || !host) return;
+      const cols = fittedColumns(clampInt(settings.columnCount, 1, 8));
+      if (cols !== stats.columnCount) {
+        stats.columnCount = cols;
+        setInline('gridTemplateColumns', 'repeat(' + cols + ', minmax(0, 1fr))');
+      }
+      scheduleMasonry();
+    });
+  }
 
   let masonryQueued = false;
   function scheduleMasonry() {
@@ -678,11 +728,10 @@
   function layoutMasonry() {
     if (!active || !host) return;
     // Only meaningful while we own the layout as a grid.
-    let gap = 0;
     try {
       if (getComputedStyle(host).display !== 'grid') return;
-      gap = parseFloat(getComputedStyle(host).rowGap) || 0;
     } catch (e) { return; }
+    const gap = cellGap;
     for (const cell of host.children) {
       if (!isEl(cell)) continue;
       if (FILLER && cell.matches && cell.matches(FILLER)) continue;
@@ -1075,7 +1124,7 @@
     wireObserver();
     wireSizeObserver();
     scheduleMasonry();
-    window.addEventListener('resize', scheduleMasonry, { passive: true });
+    window.addEventListener('resize', onViewportResize, { passive: true });
     startHealth();
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKeydown, true);
@@ -1111,7 +1160,7 @@
     stopStats();
     stopPaginationWatch();
     detachSizeObserver();
-    window.removeEventListener('resize', scheduleMasonry);
+    window.removeEventListener('resize', onViewportResize);
     clearMasonry();
     untagWidenChain();
     restoreHost();
