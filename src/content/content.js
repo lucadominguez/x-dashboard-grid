@@ -406,6 +406,10 @@
    * ------------------------------------------------------------------ */
   function applyGrid() {
     if (!host) return;
+    // Re-checked here as well as at activation: the site may not have reserved
+    // its virtual height yet when we first looked, and applyGrid runs again
+    // whenever the health watchdog re-attaches to a rebuilt feed.
+    if (isTransformVirtualized(host)) { deactivate(); standDownVirtualized(); return; }
     const cols = clampInt(settings.columnCount, 1, 8);
     stats.columnCount = cols;
     const gap = (settings.bleed ? 0 : 6) * densityScale();
@@ -540,6 +544,44 @@
 
   function stopPaginationWatch() {
     if (unvirtWatch) { clearInterval(unvirtWatch); unvirtWatch = null; }
+  }
+
+  // Recognise a transform-virtualizer BEFORE touching the page.
+  //
+  // The watchdog below can only fire once the reader has scrolled past every
+  // mounted post, so it cures the problem after they have already been shown a
+  // broken grid: five columns of one-word-per-line text over five posts that
+  // never grow. The signature is unmistakable up front, and both halves are
+  // needed - absolutely positioned children placed by transform, AND a large
+  // inline min-height on the container, which is the virtual scroll height the
+  // site reserves for posts it has not mounted. Reddit has neither; x.com has
+  // both (measured: min-height 11270px over four mounted cells).
+  function isTransformVirtualized(el) {
+    if (!el) return false;
+    let inlineMinH = 0;
+    try { inlineMinH = parseFloat(el.style.minHeight) || 0; } catch (e) { return false; }
+    if (inlineMinH < 1500) return false;
+    let abs = 0, n = 0;
+    for (const k of el.children) {
+      if (!isEl(k) || n >= 8) break;
+      n++;
+      try {
+        const d = getComputedStyle(k);
+        if ((d.position === 'absolute' || d.position === 'fixed') && d.transform !== 'none') abs++;
+      } catch (e) {}
+    }
+    return n >= 2 && abs >= Math.max(2, n * 0.5);
+  }
+
+  function standDownVirtualized() {
+    virtualizedGiveUp = true;
+    const label = SITE ? SITE.label : 'this site';
+    showFatal('GridX cannot grid ' + label + "'s timeline. The site renders it "
+      + 'virtualized: it places posts itself and stops loading more as soon as '
+      + 'anything else lays them out, so a grid here would show a handful of '
+      + 'posts and then stop. Leaving the site layout untouched. Press the '
+      + 'toolbar toggle to override.');
+    log('stood down: feed is transform-virtualized');
   }
 
   function detectOutOfFlow() {
@@ -1017,6 +1059,9 @@
       scheduleRetry();
       return;
     }
+    // Decide before we restyle anything: a grid we will have to retract is
+    // worse than no grid, because the reader sees the broken state first.
+    if (isTransformVirtualized(host)) { standDownVirtualized(); return; }
     active = true;
     document.documentElement.classList.add(CLASS_ACTIVE);
     document.documentElement.classList.add('gridx-site-' + SITE.id);
