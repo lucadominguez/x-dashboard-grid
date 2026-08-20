@@ -46,6 +46,20 @@ html.gridx-active [data-testid="primaryColumn"] {
   max-width: none !important;
   margin: 0 auto !important;
 }
+/* Neither of the rules above reaches the cap that actually binds. Measured on
+   live x.com at a 1280px viewport: an intermediate wrapper between the feed
+   and primaryColumn carries max-width:600px, and MAIN is a column flex box
+   that CENTRES its child rather than stretching it. Result was three 196px
+   columns - text wrapping after three words, avatars collapsed to grey
+   squares, metric counts printed on top of each other. JS tags this one
+   ancestor chain so the caps are lifted only in the feed's own path; with them
+   gone the same viewport gives three 412px columns and all three symptoms
+   disappear at once. */
+html.gridx-active [data-gx-widen] {
+  max-width: none !important;
+  width: 100% !important;
+}
+html.gridx-active main { align-items: stretch !important; }
 
 /* --- Density/font/brand vars cascading from <html> into the feed. ------- */
 html.gridx-active {
@@ -139,8 +153,12 @@ html.gridx-scan .gx-stream [role="group"] { display: none !important; }
  * own feed container and never move a node.
  * ========================================================================== */
 
-/* Separators between entries would each occupy their own grid cell. */
-.gx-stream > hr { display: none !important; }
+/* Separators between entries would each occupy their own grid cell. new.reddit
+   uses <hr>; old.reddit follows every post with an empty float-clearing div.
+   Measured on live old.reddit.com: 25 posts and 25 .clearleft spacers, so a
+   third of the grid was blank and the reading order zigzagged across it. */
+.gx-stream > hr,
+.gx-stream > .clearleft { display: none !important; }
 
 /* Reddit's post wrapper and the custom element must not force a min width
    wider than the column, or the grid overflows horizontally. */
@@ -193,6 +211,16 @@ html.gridx-scan .gx-stream .thing.link .buttons { display: none !important; }
 
 /* old.reddit lays posts out in a table-ish flow; neutralize the float. */
 .gx-stream .thing.link { float: none !important; display: block !important; }
+
+/* old.reddit reserves a fixed right rail and gives .content a matching right
+   margin, which cost 325px of a 1280px viewport. Drop the rail the same way we
+   drop X's and new.reddit's, and reclaim the margin it reserved. */
+html.gridx-active.gridx-site-reddit .side { display: none !important; }
+html.gridx-active.gridx-site-reddit .content[role="main"],
+html.gridx-active.gridx-site-reddit body > .content {
+  margin-right: 0 !important;
+  width: auto !important;
+}
 
 
 /* --- Kill X animation on the grid path (fast scanning). ------------------ */

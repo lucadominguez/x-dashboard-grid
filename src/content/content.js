@@ -102,6 +102,10 @@
       filler: '',
       // X's timeline container is itself the scroller.
       ownScroller: true,
+      // x.com caps the timeline at 600px on an obfuscated intermediate wrapper
+      // and centres MAIN's single flex child. Hiding the rails does not lift
+      // either, so the whole ancestor chain has to be widened by hand.
+      widenChain: true,
       permalink: (el) => { const l = el.querySelector('a[href*="/status/"]'); return l ? l.href : ''; },
       sponsored: (el) => !!el.querySelector('a[aria-label*="sponsored"]'),
       repost: (el) => /reposted/i.test(el.textContent || ''),
@@ -117,9 +121,15 @@
         'shreddit-app', '#main-content', '.subgrid-container', '.grid-container',
         'header', 'nav', 'main', 'body', 'html',
       ],
-      filler: 'hr',
+      // new.reddit separates entries with <hr>; old.reddit follows every
+      // .thing with an empty <div class="clearleft">. Measured on live
+      // old.reddit.com: 25 posts and 25 clearleft spacers, so a THIRD of the
+      // grid was blank cells and the reading order zigzagged.
+      filler: 'hr, .clearleft',
       // Reddit scrolls the document; the feed is not a scroller.
       ownScroller: false,
+      // Reddit's own rails are hidden in CSS; no ancestor cap to lift.
+      widenChain: false,
       permalink: (el) => {
         const a = el.getAttribute && (el.getAttribute('permalink') || el.getAttribute('data-permalink'));
         if (a) { try { return new URL(a, location.origin).href; } catch (e) {} }
@@ -321,6 +331,46 @@
   // activation, BEFORE we touch any styles, because applyGrid would otherwise
   // make the host look like a scroller and the answer would always be yes.
   let hostWasScroller = false;
+
+  // How much scroll range does the PAGE actually have? Asking documentElement
+  // alone is wrong: on live x.com <html> is exactly viewport-height with no
+  // range at all, and <body> is the element that scrolls (measured: html
+  // scrollHeight 678 === clientHeight, body scrollHeight 1540 / clientHeight
+  // 678). A guard that read only documentElement therefore concluded "this
+  // page cannot scroll" about a page that scrolls perfectly well.
+  function pageScrollRange() {
+    let best = 0;
+    const els = [document.documentElement, document.body, host];
+    for (const el of els) {
+      if (!el) continue;
+      try { best = Math.max(best, el.scrollHeight - el.clientHeight); } catch (e) {}
+    }
+    return best;
+  }
+
+  // x.com caps its timeline column at 600px on an intermediate wrapper whose
+  // class is obfuscated, and MAIN centres its single child instead of
+  // stretching it. Both survive hiding the rails, so on a 1280px viewport the
+  // grid rendered 196px columns: post text wrapped after three words, avatars
+  // collapsed to grey squares and the metric row overlapped itself. Tagging
+  // our own ancestor chain lets the stylesheet lift the caps in that path only,
+  // rather than firing !important width rules at the whole document.
+  function tagWidenChain() {
+    if (!host || !SITE || !SITE.widenChain) return;
+    let el = host;
+    let hops = 0;
+    while (el && el !== document.body && hops++ < 12) {
+      el.setAttribute('data-gx-widen', '1');
+      if (el.tagName === 'MAIN') break;
+      el = el.parentElement;
+    }
+  }
+
+  function untagWidenChain() {
+    document.querySelectorAll('[data-gx-widen]')
+      .forEach((el) => el.removeAttribute('data-gx-widen'));
+  }
+
   function detectScroller(el) {
     if (!el) return false;
     try {
@@ -407,20 +457,63 @@
   // pages by scroll offset, removing it can leave the page unable to scroll at
   // all - which is strictly worse than no grid. Verify, and back out if so.
   let unvirtBlocked = false;
+  function revertUnvirtualize(reason) {
+    document.documentElement.classList.remove(CLASS_UNVIRT);
+    unvirtBlocked = true;
+    setStatus('GridX: this feed is virtualized, keeping the site layout', 6000);
+    log('unvirtualize reverted:', reason);
+  }
+
   function verifyUnvirtualize() {
     if (!active || !host) return;
-    const doc = document.documentElement;
-    if (!doc.classList.contains(CLASS_UNVIRT)) return;
-    const docRange = doc.scrollHeight - (window.innerHeight || 0);
-    const hostRange = host.scrollHeight - host.clientHeight;
-    const canScroll = docRange > 200 || hostRange > 200;
-    const hasMore = articles().length >= 8;
+    if (!document.documentElement.classList.contains(CLASS_UNVIRT)) return;
+    // The old threshold of 8 posts was unreachable in the only case that
+    // matters: killing the scroll range is exactly what stops more posts
+    // arriving, so the count stays low and the guard never fired. Three posts
+    // is enough to know a feed rendered.
+    const canScroll = pageScrollRange() > 200;
+    const hasMore = articles().length >= 3;
     if (!canScroll && hasMore) {
-      doc.classList.remove(CLASS_UNVIRT);
-      unvirtBlocked = true;
-      setStatus('GridX: this feed is virtualized, keeping the site layout', 6000);
-      log('unvirtualize reverted: it removed the page scroll range');
+      revertUnvirtualize('it removed the page scroll range');
+      return;
     }
+    startPaginationWatch();
+  }
+
+  // Losing the scroll range is the loud failure. The quiet one is worse: the
+  // page still scrolls, but the site's virtualizer decides what to mount from
+  // its own model of where each cell sits, and putting the cells back in flow
+  // invalidates that model. Measured on live x.com: scrolling 4000px left the
+  // mounted count pinned at 8 and the unique-post count at 7, with 7000px of
+  // blank container below the last post. Watch for the reader running out of
+  // feed and back out to the site's own layout when they do.
+  let unvirtWatch = null;
+  function startPaginationWatch() {
+    stopPaginationWatch();
+    if (!host) return;
+    const baseline = articles().length;
+    let strikes = 0;
+    unvirtWatch = setInterval(() => {
+      if (!active || !host || !document.documentElement.classList.contains(CLASS_UNVIRT)) {
+        stopPaginationWatch();
+        return;
+      }
+      const last = host.children[host.children.length - 1];
+      if (!last) return;
+      let bottom = 0;
+      try { bottom = last.getBoundingClientRect().bottom; } catch (e) { return; }
+      // Scrolled clean past every mounted post, and nothing new arrived.
+      if (bottom < 0 && articles().length <= baseline) strikes++;
+      else strikes = 0;
+      if (strikes >= 3) {
+        revertUnvirtualize('the feed stopped mounting posts in grid layout');
+        stopPaginationWatch();
+      }
+    }, 1000);
+  }
+
+  function stopPaginationWatch() {
+    if (unvirtWatch) { clearInterval(unvirtWatch); unvirtWatch = null; }
   }
 
   function detectOutOfFlow() {
@@ -723,6 +816,7 @@
     document.documentElement.classList.add(CLASS_ACTIVE);
     document.documentElement.classList.add('gridx-site-' + SITE.id);
     savedStyles = {};
+    tagWidenChain();
     hostWasScroller = detectScroller(host);
     document.documentElement.classList.toggle(CLASS_LOCK, hostWasScroller);
     log('scroll owner:', hostWasScroller ? 'feed container' : 'document');
@@ -756,6 +850,8 @@
     detachObserver();
     stopHealth();
     stopStats();
+    stopPaginationWatch();
+    untagWidenChain();
     restoreHost();
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKeydown, true);

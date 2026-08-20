@@ -27,8 +27,11 @@ def check(name, ok, detail=""):
 
 
 def find_chrome():
+    # Linux (WSL) first, then Windows: this repo gets driven from both.
     for pat in ("/tmp/pw-browsers/chromium-*/chrome-linux/chrome",
-                os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome")):
+                os.path.expanduser("~/.cache/ms-playwright/chromium-*/chrome-linux/chrome"),
+                os.path.expandvars(r"%LOCALAPPDATA%\ms-playwright\chromium-*\chrome-win\chrome.exe"),
+                ):
         hits = sorted(glob.glob(pat))
         if hits:
             return hits[-1]
