@@ -219,6 +219,16 @@ html.gridx-active.gx-hide-metrics .gx-stream [slot="post-media-container"] ~ div
 html.gridx-active.gx-hide-metrics .gx-stream .thing.link .buttons,
 html.gridx-scan .gx-stream .thing.link .buttons { display: none !important; }
 
+/* Reddit pads each post 16px on both sides. Inside a grid cell that is 32px of
+   a column spent on whitespace the grid gap already provides, and it is what
+   pushed the action row past the cell edge: measured on live www.reddit.com at
+   four columns, the Share button's right edge sat 6px beyond the post's. The
+   row cannot be fixed from the inside - Reddit builds it in a shadow root that
+   no content stylesheet can select into - so the only lever is to stop wasting
+   the width in the first place. */
+html.gridx-active .gx-stream shreddit-post,
+html.gridx-active .gx-stream shreddit-ad-post { padding-inline: 6px !important; }
+
 /* old.reddit lays posts out in a table-ish flow; neutralize the float. */
 .gx-stream .thing.link { float: none !important; display: block !important; }
 
