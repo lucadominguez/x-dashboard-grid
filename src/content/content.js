@@ -106,9 +106,9 @@
       // and centres MAIN's single flex child. Hiding the rails does not lift
       // either, so the whole ancestor chain has to be widened by hand.
       widenChain: true,
-      // Below this a post stops being readable: X's tweet layout carries an
-      // avatar gutter and an action row before a word of text is placed.
-      minColumn: 300,
+      // An absolute floor, not a comfort preference: below this X's avatar
+      // gutter and action row leave no room for text at all.
+      minColumn: 260,
       // A grid of one post is not a grid. /status/ is the permalink view and
       // /i/ covers the photo and modal routes X opens on top of it.
       feedRoute: (p) => !/\/status\/\d+/.test(p) && !/^\/i\//.test(p),
@@ -136,9 +136,11 @@
       ownScroller: false,
       // Reddit's own rails are hidden in CSS; no ancestor cap to lift.
       widenChain: false,
-      // old.reddit spends ~40px of every cell on the vote gutter before any
-      // text, and new.reddit's action row needs the rest.
-      minColumn: 250,
+      // An absolute floor. 250 was a comfort figure and it silently capped a
+      // request for eight columns at four, which is not a call GridX gets to
+      // make: asking for eight columns is asking for dense, and the scaling
+      // and wrapping rules below are what keep dense legible.
+      minColumn: 120,
       // /comments/ is Reddit's single-post view on both new and old.
       feedRoute: (p) => !/\/comments\//.test(p),
       permalink: (el) => {
@@ -702,12 +704,11 @@
 
   // A narrower window may no longer carry the column count we picked, so the fit
   // has to be recomputed before the cells are re-packed against it.
-  let resizeQueued = false;
+  let resizeTimer = null;
   function onViewportResize() {
-    if (resizeQueued || !active) return;
-    resizeQueued = true;
-    requestAnimationFrame(() => {
-      resizeQueued = false;
+    if (resizeTimer || !active) return;
+    resizeTimer = setTimeout(() => {
+      resizeTimer = null;
       if (!active || !host) return;
       const cols = fittedColumns(clampInt(settings.columnCount, 1, 8));
       if (cols !== stats.columnCount) {
@@ -715,14 +716,21 @@
         setInline('gridTemplateColumns', 'repeat(' + cols + ', minmax(0, 1fr))');
       }
       scheduleMasonry();
-    });
+    }, 16);
   }
 
-  let masonryQueued = false;
+  // A latch guarded by requestAnimationFrame is a trap: rAF callbacks do not
+  // run while the document is hidden, so a pass scheduled in a background or
+  // minimised window never fires, the latch never reopens, and every later
+  // request returns early - the packing is dead for the rest of the page's
+  // life with no error anywhere. That is why cells kept their fallback span on
+  // www.reddit.com while old.reddit, which happened to schedule while visible,
+  // packed correctly. A timer fires either way, and layout reads are
+  // synchronous regardless of paint.
+  let masonryTimer = null;
   function scheduleMasonry() {
-    if (masonryQueued || !active) return;
-    masonryQueued = true;
-    requestAnimationFrame(() => { masonryQueued = false; layoutMasonry(); });
+    if (masonryTimer || !active) return;
+    masonryTimer = setTimeout(() => { masonryTimer = null; layoutMasonry(); }, 16);
   }
 
   function layoutMasonry() {
@@ -897,9 +905,12 @@
         if (touchesPost(r.addedNodes) || touchesPost(r.removedNodes)) { relevant = true; break; }
       }
       if (!relevant) return;
-      // Coalesce a burst of mutations into a single pass per frame.
+      // Coalesce a burst of mutations into a single pass. This used to latch on
+      // requestAnimationFrame, which never fires in a hidden tab - so a burst
+      // arriving while the window was in the background left scanQueued stuck
+      // true and every subsequent mutation was dropped for good.
       scanQueued = true;
-      requestAnimationFrame(() => {
+      setTimeout(() => {
         scanQueued = false;
         if (!active || paused) return;
         // Only re-resolve the container if the one we hold actually went away;
@@ -911,10 +922,10 @@
             ensureOverlay(); applyGrid(); wireObserver();
           }
         }
-        recomputeFilters();
+        try { recomputeFilters(); } catch (e) { log('filter pass failed', e); }
         wireSizeObserver();
         scheduleMasonry();
-      });
+      }, 16);
     });
     observer.observe(host, { childList: true, subtree: true });
   }
