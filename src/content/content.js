@@ -608,13 +608,26 @@
 
   function standDownVirtualized() {
     virtualizedGiveUp = true;
+    // Kill the retry loop first, or it keeps announcing "feed not found" over
+    // the top of the explanation - which is exactly what it did on x.com.
+    if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
+    hideFatal();
     const label = SITE ? SITE.label : 'this site';
-    showFatal('GridX cannot grid ' + label + "'s timeline. The site renders it "
-      + 'virtualized: it places posts itself and stops loading more as soon as '
-      + 'anything else lays them out, so a grid here would show a handful of '
-      + 'posts and then stop. Leaving the site layout untouched. Press the '
-      + 'toolbar toggle to override.');
+    // A modal in the middle of the timeline is the wrong shape for "we are
+    // doing nothing here". Say it once, quietly, then remove every trace of
+    // GridX from the page: on a site we refuse to touch, leaving a filter bar
+    // and a dialog behind is worse than saying nothing at all.
+    setStatus('GridX: ' + label + ' renders its timeline virtualized, so the '
+      + 'grid would stall after a few posts. Leaving the site as it is.', 7000);
+    setTimeout(teardownOverlay, 7600);
     log('stood down: feed is transform-virtualized');
+  }
+
+  function teardownOverlay() {
+    if (!root) return;
+    try { root.remove(); } catch (e) {}
+    root = null; fatalEl = null; filterInput = null; keymapEl = null;
+    statsEl = null; hintsEl = null;
   }
 
   function detectOutOfFlow() {
@@ -1150,7 +1163,7 @@
   }
 
   function scheduleRetry() {
-    if (retryTimer) return;
+    if (retryTimer || virtualizedGiveUp) return;
     let tries = 0;
     retryTimer = setInterval(() => {
       tries++;
@@ -1197,10 +1210,15 @@
   // classes/inline styles already restored). Nothing to move back.
   function replantAll() { /* no-op in re-flow architecture: X is untouched */ }
 
-  function showFatal(msg) {
+  function showFatal(msg, title) {
     if (!fatalEl) return;
     const ps = fatalEl.querySelectorAll('p');
+    // The heading is markup, so a caller that only replaced the body left the
+    // default "feed not found" standing above an unrelated message.
+    const h = fatalEl.querySelector('h1, h2, h3, strong');
+    if (h && title) h.textContent = title;
     if (msg && ps[1]) ps[1].textContent = msg;
+    if (ps[0]) ps[0].hidden = !!title;
     fatalEl.hidden = false;
   }
   function hideFatal() { if (fatalEl) fatalEl.hidden = true; }
