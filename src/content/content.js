@@ -753,26 +753,62 @@
       if (getComputedStyle(host).display !== 'grid') return;
     } catch (e) { return; }
     const gap = cellGap;
+    // Place every cell EXPLICITLY. Two approaches were measured on the live
+    // front page and only one is right for a feed.
+    //
+    // The grid's own auto-placement is "sparse": its cursor only moves forward,
+    // so with uneven spans an item lands at the first slot at-or-after the
+    // cursor that happens to fit. That put post 8 directly under post 1, ahead
+    // of 5, 6 and 7 - rows read 1 2 3 4, then 8 5 6 7, then 11 9 10 12.
+    //
+    // Classic masonry (always fill the shortest column) packs just as tightly
+    // but scrambles the order for the same reason: one column being a single
+    // 4px track taller is enough to send the next post somewhere unexpected.
+    // A feed is ordered by rank, so an order the reader cannot follow costs
+    // more than a ragged bottom edge does.
+    //
+    // Round-robin keeps both: post i goes to column i % cols and stacks flush
+    // under the previous post in that column. Rows read 1 2 3 4, then 5 6 7 8,
+    // with post 5 sitting 9px under post 1 - no row-height holes, order intact.
+    const cols = Math.max(1, (getComputedStyle(host).gridTemplateColumns || '')
+      .split(' ').filter(Boolean).length);
+    const colRows = new Array(cols).fill(0);
+    let idx = 0;
     for (const cell of host.children) {
       if (!isEl(cell)) continue;
       if (FILLER && cell.matches && cell.matches(FILLER)) continue;
-      stats.effectiveColumns = stats.effectiveColumns || 0;
       let h = 0;
-      try { h = cell.getBoundingClientRect().height; } catch (e) { continue; }
-      if (!h) { cell.style.removeProperty('grid-row-end'); continue; }
+      try {
+        if (getComputedStyle(cell).display === 'none') continue;
+        h = cell.getBoundingClientRect().height;
+      } catch (e) { continue; }
+      if (!h) { clearPlacement(cell); continue; }
       const span = Math.max(1, Math.ceil((h + gap) / ROW_UNIT));
-      const want = 'span ' + span;
-      // Writing an unchanged value still dirties layout; skip the no-ops.
-      if (cell.style.gridRowEnd !== want) cell.style.gridRowEnd = want;
+      const c = idx % cols;
+      idx++;
+      setPlacement(cell, c + 1, colRows[c] + 1, span);
+      colRows[c] += span;
     }
     stats.effectiveColumns = measureColumns();
   }
 
+  // Writing an unchanged value still dirties layout, so every write is guarded.
+  function setPlacement(cell, col, row, span) {
+    const c = String(col), r = String(row), e = 'span ' + span;
+    if (cell.style.gridColumnStart !== c) cell.style.gridColumnStart = c;
+    if (cell.style.gridRowStart !== r) cell.style.gridRowStart = r;
+    if (cell.style.gridRowEnd !== e) cell.style.gridRowEnd = e;
+  }
+
+  function clearPlacement(cell) {
+    cell.style.removeProperty('grid-column-start');
+    cell.style.removeProperty('grid-row-start');
+    cell.style.removeProperty('grid-row-end');
+  }
+
   function clearMasonry() {
     if (!host) return;
-    for (const cell of host.children) {
-      if (isEl(cell)) cell.style.removeProperty('grid-row-end');
-    }
+    for (const cell of host.children) if (isEl(cell)) clearPlacement(cell);
   }
 
   // Cells grow after the fact: images decode, embeds resize, "Show more"
