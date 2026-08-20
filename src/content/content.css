@@ -240,7 +240,9 @@ html.gridx-active .gx-expanded div {
 }
 /* Expanded posts are read, not scanned: give them full size even in a narrow
    column, and lift them above their neighbours while they are open. */
-html.gridx-active .gx-stream > .gx-expanded { z-index: 4; position: relative; }
+/* z-index only: forcing `position` here would yank a single X cell out of the
+   virtualizer's absolute placement and make it jump across the feed. */
+html.gridx-active .gx-stream > .gx-expanded { z-index: 4; }
 html.gridx-active .gx-stream > .gx-expanded shreddit-post,
 html.gridx-active .gx-stream > .gx-expanded shreddit-ad-post,
 html.gridx-active .gx-stream > .gx-expanded .thing.link { zoom: 1 !important; }
