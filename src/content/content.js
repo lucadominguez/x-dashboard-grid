@@ -432,7 +432,7 @@
     // Re-checked here as well as at activation: the site may not have reserved
     // its virtual height yet when we first looked, and applyGrid runs again
     // whenever the health watchdog re-attaches to a rebuilt feed.
-    if (isTransformVirtualized(host)) { deactivate(); standDownVirtualized(); return; }
+    if (isTransformVirtualized(host)) { restoreHost(); untagWidenChain(); startMirror(); return; }
     const requested = clampInt(settings.columnCount, 1, 8);
     const cols = fittedColumns(requested);
     if (cols !== requested) {
@@ -604,6 +604,171 @@
       } catch (e) {}
     }
     return n >= 2 && abs >= Math.max(2, n * 0.5);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Mirror mode: the grid for feeds that place their own posts.
+   *
+   * x.com cannot be gridded in place, and this was established by measurement
+   * rather than argument. Its timeline container carries an inline min-height
+   * equal to the virtual scroll height, and every cell is absolutely
+   * positioned by a transform. Move those cells by ANY means - put them back
+   * in flow, or collapse the reserved height so real content fills the scroll
+   * range - and the virtualizer stops feeding: measured 8 posts, frozen,
+   * across 4000px of scrolling in both directions.
+   *
+   * The second measurement is what made a grid possible anyway. On an
+   * UNTOUCHED x.com the mounted count also sits at 8-9, because X unmounts
+   * posts as they leave the viewport; that is its normal steady state, not a
+   * symptom. Unique posts keep arriving as the reader scrolls. So the feed is
+   * not broken - it just never holds more than a screenful at once.
+   *
+   * Mirror mode therefore touches X's timeline not at all. It watches posts
+   * mount, keeps a clone of each one, and paints the accumulated set into its
+   * own grid layered over the column. The overlay takes no pointer events, so
+   * the wheel still reaches X underneath and its virtualizer keeps working on
+   * the reader's own scrolling - which matters, because a content script
+   * cannot drive it: programmatic scrolling moved the page 4800px and mounted
+   * nothing, since X responds to trusted input only.
+   * ------------------------------------------------------------------ */
+  const MIRROR_CAP = 400;   // clones retained before the oldest are dropped
+  let mirror = null;
+
+  function startMirror() {
+    stopMirror();
+    const main = document.querySelector('main') || document.body;
+    const root = document.createElement('div');
+    root.id = 'gridx-mirror';
+    const inner = document.createElement('div');
+    inner.id = 'gridx-mirror-inner';
+    root.appendChild(inner);
+    document.body.appendChild(root);
+    mirror = { root: root, inner: inner, seen: new Map(), order: [], main: main };
+    positionMirror();
+    applyMirrorColumns();
+    document.documentElement.classList.add('gridx-mirror-on');
+    captureIntoMirror();
+    syncMirror();
+    mirror.obs = new MutationObserver(() => scheduleMirror());
+    if (host) mirror.obs.observe(host, { childList: true, subtree: true });
+    mirror.onScroll = () => scheduleMirror();
+    window.addEventListener('scroll', mirror.onScroll, { passive: true });
+    window.addEventListener('resize', mirror.onResize = () => {
+      positionMirror(); applyMirrorColumns(); scheduleMirror();
+    }, { passive: true });
+    setStatus('GridX: mirroring ' + (SITE ? SITE.label : 'this feed')
+      + ' - scroll as usual and posts collect into the grid', 6000);
+  }
+
+  function stopMirror() {
+    if (!mirror) return;
+    if (mirror.obs) mirror.obs.disconnect();
+    window.removeEventListener('scroll', mirror.onScroll);
+    window.removeEventListener('resize', mirror.onResize);
+    try { mirror.root.remove(); } catch (e) {}
+    document.documentElement.classList.remove('gridx-mirror-on');
+    mirror = null;
+  }
+
+  function positionMirror() {
+    if (!mirror) return;
+    let r;
+    try { r = mirror.main.getBoundingClientRect(); } catch (e) { return; }
+    const top = 0;
+    mirror.root.style.left = Math.round(r.left) + 'px';
+    mirror.root.style.width = Math.round(r.width) + 'px';
+    mirror.root.style.top = top + 'px';
+    mirror.root.style.height = (window.innerHeight - top) + 'px';
+    try {
+      mirror.root.style.background = getComputedStyle(document.body).backgroundColor || '#fff';
+    } catch (e) {}
+  }
+
+  function applyMirrorColumns() {
+    if (!mirror) return;
+    const requested = clampInt(settings.columnCount, 1, 8);
+    const min = (SITE && SITE.minColumn) || 200;
+    const w = mirror.root.getBoundingClientRect().width || window.innerWidth;
+    const gap = (settings.bleed ? 0 : 8) * densityScale();
+    const fits = Math.max(1, Math.floor((w + gap) / (min + gap)));
+    const cols = Math.max(1, Math.min(requested, fits));
+    mirror.cols = cols;
+    mirror.gap = gap;
+    stats.columnCount = cols;
+    stats.effectiveColumns = cols;
+    mirror.inner.style.gridTemplateColumns = 'repeat(' + cols + ', minmax(0, 1fr))';
+    mirror.inner.style.columnGap = gap + 'px';
+  }
+
+  function captureIntoMirror() {
+    if (!mirror || !host) return 0;
+    let added = 0;
+    const posts = host.querySelectorAll(ARTICLE);
+    for (const a of posts) {
+      let url = '';
+      try { url = SITE.permalink(a) || ''; } catch (e) {}
+      if (!url || mirror.seen.has(url)) continue;
+      let clone;
+      try { clone = a.cloneNode(true); } catch (e) { continue; }
+      clone.dataset.gxUrl = url;
+      clone.classList.add('gx-mirror-cell');
+      mirror.seen.set(url, clone);
+      mirror.order.push(url);
+      mirror.inner.appendChild(clone);
+      added++;
+    }
+    // Bound the memory a long session can accumulate.
+    while (mirror.order.length > MIRROR_CAP) {
+      const drop = mirror.order.shift();
+      const el = mirror.seen.get(drop);
+      if (el) { try { el.remove(); } catch (e) {} }
+      mirror.seen.delete(drop);
+    }
+    return added;
+  }
+
+  function packMirror() {
+    if (!mirror) return 0;
+    const cols = mirror.cols || 1;
+    const gap = mirror.gap || 8;
+    const colRows = new Array(cols).fill(0);
+    let i = 0;
+    for (const cell of mirror.inner.children) {
+      let h = 0;
+      try { h = cell.getBoundingClientRect().height; } catch (e) { continue; }
+      if (!h) continue;
+      const span = Math.max(1, Math.ceil((h + gap) / ROW_UNIT));
+      const c = i % cols;
+      i++;
+      setPlacement(cell, c + 1, colRows[c] + 1, span);
+      colRows[c] += span;
+    }
+    let tallest = 0;
+    for (const r of colRows) if (r > tallest) tallest = r;
+    return tallest * ROW_UNIT;
+  }
+
+  // The page's scroll range belongs to the site's virtual height, which is far
+  // longer than the grid it produces. Map one onto the other so a full scroll
+  // of the page walks the whole grid.
+  function syncMirror() {
+    if (!mirror) return;
+    captureIntoMirror();
+    const gridH = packMirror();
+    const viewH = mirror.root.clientHeight || window.innerHeight;
+    const doc = document.documentElement;
+    const pageRange = Math.max(1, doc.scrollHeight - window.innerHeight);
+    const gridRange = Math.max(0, gridH - viewH);
+    const f = Math.min(1, Math.max(0, (doc.scrollTop || document.body.scrollTop || 0) / pageRange));
+    mirror.inner.style.transform = 'translateY(' + (-Math.round(f * gridRange)) + 'px)';
+    stats.postsRendered = mirror.seen.size;
+    updateStatsReadout();
+  }
+
+  let mirrorTimer = null;
+  function scheduleMirror() {
+    if (mirrorTimer || !mirror) return;
+    mirrorTimer = setTimeout(() => { mirrorTimer = null; syncMirror(); }, 80);
   }
 
   function standDownVirtualized() {
@@ -1047,7 +1212,7 @@
       'a, [role="link"], [role="button"], button, [tabindex], input, textarea, video, audio, img, select'
     );
     if (interactive) return;
-    const art = e.target.closest(ARTICLE);
+    const art = e.target.closest('.gx-mirror-cell') || e.target.closest(ARTICLE);
     if (!art) return;
     const url = art.dataset.gxUrl || (SITE ? SITE.permalink(art) : '');
     if (!url) return;
@@ -1168,9 +1333,20 @@
       scheduleRetry();
       return;
     }
-    // Decide before we restyle anything: a grid we will have to retract is
-    // worse than no grid, because the reader sees the broken state first.
-    if (isTransformVirtualized(host)) { standDownVirtualized(); return; }
+    // Decide before we restyle anything. A feed that places its own posts
+    // cannot be re-flowed in place, but it CAN be mirrored: leave it alone
+    // entirely and build the grid from clones as posts mount.
+    if (isTransformVirtualized(host)) {
+      active = true;
+      document.documentElement.classList.add(CLASS_ACTIVE);
+      document.documentElement.classList.add('gridx-site-' + SITE.id);
+      startMirror();
+      document.addEventListener('click', onClick, true);
+      document.addEventListener('keydown', onKeydown, true);
+      startStats();
+      log('mirror mode: feed is transform-virtualized');
+      return;
+    }
     active = true;
     document.documentElement.classList.add(CLASS_ACTIVE);
     document.documentElement.classList.add('gridx-site-' + SITE.id);
@@ -1219,6 +1395,7 @@
     stopHealth();
     stopStats();
     stopPaginationWatch();
+    stopMirror();
     detachSizeObserver();
     window.removeEventListener('resize', onViewportResize);
     clearMasonry();

@@ -514,3 +514,46 @@ html.gridx-active .gx-stream *,
   border-radius: 999px;
   cursor: pointer;
 }
+
+/* ===========================================================================
+ * Mirror mode (feeds that place their own posts, e.g. x.com).
+ *
+ * The overlay must never take pointer events: the wheel has to reach the real
+ * timeline underneath so the site's virtualizer keeps mounting posts on the
+ * reader's own scrolling. Individual cells opt back in so a post can be
+ * clicked; a cell is not a scroll container, so the wheel still passes through.
+ * ========================================================================== */
+#gridx-mirror {
+  position: fixed;
+  z-index: 9998;
+  pointer-events: none;
+  overflow: hidden;
+  contain: strict;
+}
+#gridx-mirror-inner {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  display: grid;
+  align-items: start;
+  align-content: start;
+  row-gap: 0;
+  grid-auto-rows: 4px;
+  will-change: transform;
+}
+#gridx-mirror-inner > * {
+  pointer-events: auto;
+  overflow: hidden;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.22);
+  grid-row-end: span 55;
+}
+/* The mirrored copy is a snapshot, so anything that would invite an action the
+   clone cannot perform is hidden rather than left to fail silently. */
+#gridx-mirror-inner [role="group"] { opacity: 0.55; }
+html.gridx-mirror-on #gridx-mirror-inner [data-testid="tweetPhoto"] img,
+html.gridx-mirror-on #gridx-mirror-inner img { max-width: 100%; height: auto; }
