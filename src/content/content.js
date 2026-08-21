@@ -648,13 +648,16 @@
     applyMirrorColumns();
     document.documentElement.classList.add('gridx-mirror-on');
     captureIntoMirror();
-    syncMirror();
-    mirror.obs = new MutationObserver(() => scheduleMirror());
+    syncMirror(true);
+    if (typeof ResizeObserver !== 'undefined') {
+      mirror.sizes = new ResizeObserver(() => scheduleMirror(true));
+    }
+    mirror.obs = new MutationObserver(() => scheduleMirror(true));
     if (host) mirror.obs.observe(host, { childList: true, subtree: true });
     mirror.onScroll = () => scheduleMirror();
     window.addEventListener('scroll', mirror.onScroll, { passive: true });
     window.addEventListener('resize', mirror.onResize = () => {
-      positionMirror(); applyMirrorColumns(); scheduleMirror();
+      positionMirror(); applyMirrorColumns(); scheduleMirror(true);
     }, { passive: true });
     setStatus('GridX: mirroring ' + (SITE ? SITE.label : 'this feed')
       + ' - scroll as usual and posts collect into the grid', 6000);
@@ -663,6 +666,7 @@
   function stopMirror() {
     if (!mirror) return;
     if (mirror.obs) mirror.obs.disconnect();
+    if (mirror.sizes) mirror.sizes.disconnect();
     window.removeEventListener('scroll', mirror.onScroll);
     window.removeEventListener('resize', mirror.onResize);
     try { mirror.root.remove(); } catch (e) {}
@@ -670,13 +674,25 @@
     mirror = null;
   }
 
+  // Cover the timeline column and the dead space to its right, and start below
+  // whatever the site keeps at the top. Anchoring to <main> covered the whole
+  // window - X's own left nav and tab strip included - which made the page
+  // look broken rather than gridded.
   function positionMirror() {
     if (!mirror) return;
+    const col = document.querySelector('[data-testid="primaryColumn"]') || host;
     let r;
-    try { r = mirror.main.getBoundingClientRect(); } catch (e) { return; }
-    const top = 0;
-    mirror.root.style.left = Math.round(r.left) + 'px';
-    mirror.root.style.width = Math.round(r.width) + 'px';
+    try { r = col.getBoundingClientRect(); } catch (e) { return; }
+    // The feed's own top edge is the honest place to start: it clears the
+    // header and the tab strip without having to know their heights.
+    let top = 0;
+    try {
+      const hr = host.getBoundingClientRect();
+      top = Math.max(0, Math.min(window.innerHeight - 80, Math.round(hr.top)));
+    } catch (e) {}
+    const left = Math.round(r.left);
+    mirror.root.style.left = left + 'px';
+    mirror.root.style.width = Math.max(200, Math.round(window.innerWidth - left - 8)) + 'px';
     mirror.root.style.top = top + 'px';
     mirror.root.style.height = (window.innerHeight - top) + 'px';
     try {
@@ -700,21 +716,52 @@
     mirror.inner.style.columnGap = gap + 'px';
   }
 
+  // Walk the feed's own cells rather than every <article>: a quoted post is an
+  // <article> nested inside another, so querying articles directly captured the
+  // quote as a separate cell and mismatched permalinks. Taking the OUTERMOST
+  // article in each cell also lets ads through, which carry no /status/ link -
+  // keying only on permalink silently dropped half the feed (measured: 6 cells
+  // captured from 12 mounted articles).
+  function cellKey(cell, art) {
+    let url = '';
+    try { url = (SITE.permalink(art) || ''); } catch (e) {}
+    if (url) return url;
+    const t = (art.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    return t ? 'txt:' + t : '';
+  }
+
   function captureIntoMirror() {
-    if (!mirror || !host) return 0;
+    if (!mirror) return 0;
+    // A detached node emits no mutations ever again, so if the site swapped its
+    // feed container the observer is dead and capture stops without a sound -
+    // which looks exactly like "it only ever collects the first few posts".
+    if (!host || !host.isConnected) {
+      const next = findHost();
+      if (!next) return 0;
+      host = next;
+      if (mirror.obs) {
+        mirror.obs.disconnect();
+        mirror.obs.observe(host, { childList: true, subtree: true });
+      }
+      positionMirror();
+      log('mirror re-attached to a rebuilt feed container');
+    }
     let added = 0;
-    const posts = host.querySelectorAll(ARTICLE);
-    for (const a of posts) {
-      let url = '';
-      try { url = SITE.permalink(a) || ''; } catch (e) {}
-      if (!url || mirror.seen.has(url)) continue;
+    for (const cell of host.children) {
+      if (!isEl(cell)) continue;
+      let art = null;
+      try { art = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE); } catch (e) { continue; }
+      if (!art) continue;
+      const key = cellKey(cell, art);
+      if (!key || mirror.seen.has(key)) continue;
       let clone;
-      try { clone = a.cloneNode(true); } catch (e) { continue; }
-      clone.dataset.gxUrl = url;
+      try { clone = art.cloneNode(true); } catch (e) { continue; }
+      if (key.indexOf('txt:') !== 0) clone.dataset.gxUrl = key;
       clone.classList.add('gx-mirror-cell');
-      mirror.seen.set(url, clone);
-      mirror.order.push(url);
+      mirror.seen.set(key, clone);
+      mirror.order.push(key);
       mirror.inner.appendChild(clone);
+      if (mirror.sizes) mirror.sizes.observe(clone);
       added++;
     }
     // Bound the memory a long session can accumulate.
@@ -751,10 +798,16 @@
   // The page's scroll range belongs to the site's virtual height, which is far
   // longer than the grid it produces. Map one onto the other so a full scroll
   // of the page walks the whole grid.
-  function syncMirror() {
+  // Scrolling used to re-measure and re-place every clone on each tick - up to
+  // 400 getBoundingClientRect calls plus 1200 style writes per 80ms, which is
+  // exactly the "slow and glitchy" scroll. Placement only changes when cells
+  // are added or one of them resizes, so scrolling now moves the transform and
+  // nothing else.
+  function syncMirror(repack) {
     if (!mirror) return;
-    captureIntoMirror();
-    const gridH = packMirror();
+    const added = captureIntoMirror();
+    if (repack || added) mirror.gridH = packMirror();
+    const gridH = mirror.gridH || 0;
     const viewH = mirror.root.clientHeight || window.innerHeight;
     const doc = document.documentElement;
     const pageRange = Math.max(1, doc.scrollHeight - window.innerHeight);
@@ -766,10 +819,16 @@
   }
 
   let mirrorTimer = null;
-  function scheduleMirror() {
+  function scheduleMirror(repack) {
+    if (repack) mirrorRepack = true;
     if (mirrorTimer || !mirror) return;
-    mirrorTimer = setTimeout(() => { mirrorTimer = null; syncMirror(); }, 80);
+    mirrorTimer = setTimeout(() => {
+      mirrorTimer = null;
+      const r = mirrorRepack; mirrorRepack = false;
+      syncMirror(r);
+    }, 60);
   }
+  let mirrorRepack = false;
 
   function standDownVirtualized() {
     virtualizedGiveUp = true;

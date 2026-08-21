@@ -528,7 +528,11 @@ html.gridx-active .gx-stream *,
   z-index: 9998;
   pointer-events: none;
   overflow: hidden;
-  contain: strict;
+  /* No `contain: strict` here. It buys paint isolation but turns the overlay
+     into a containment context that can swallow wheel events instead of
+     letting them chain to the page - and the page scrolling is the ONLY thing
+     that makes the site mount more posts to mirror. */
+  overscroll-behavior: auto;
 }
 #gridx-mirror-inner {
   position: absolute;
