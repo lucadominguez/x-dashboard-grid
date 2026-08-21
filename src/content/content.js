@@ -644,6 +644,7 @@
     root.appendChild(inner);
     document.body.appendChild(root);
     mirror = { root: root, inner: inner, seen: new Map(), order: [], main: main };
+    mirror.pinned = pinnedBottom();
     positionMirror();
     applyMirrorColumns();
     document.documentElement.classList.add('gridx-mirror-on');
@@ -655,8 +656,15 @@
     mirror.obs = new MutationObserver(() => scheduleMirror(true));
     if (host) mirror.obs.observe(host, { childList: true, subtree: true });
     mirror.onScroll = () => scheduleMirror();
-    window.addEventListener('scroll', mirror.onScroll, { passive: true });
+    // Scroll events do not bubble, and x.com scrolls <body> rather than the
+    // document, so this listener on window never fired ONCE: measured 0 window
+    // events against 1100px of real scrolling, which is why the grid sat frozen
+    // while the feed moved behind it. Capturing on the document sees the scroll
+    // of whichever element the site turns out to use.
+    document.addEventListener('scroll', mirror.onScroll, { passive: true, capture: true });
     window.addEventListener('resize', mirror.onResize = () => {
+      mirror.pinned = pinnedBottom();
+      mirror.top = null;
       positionMirror(); applyMirrorColumns(); scheduleMirror(true);
     }, { passive: true });
     setStatus('GridX: mirroring ' + (SITE ? SITE.label : 'this feed')
@@ -667,34 +675,79 @@
     if (!mirror) return;
     if (mirror.obs) mirror.obs.disconnect();
     if (mirror.sizes) mirror.sizes.disconnect();
-    window.removeEventListener('scroll', mirror.onScroll);
+    document.removeEventListener('scroll', mirror.onScroll, { capture: true });
     window.removeEventListener('resize', mirror.onResize);
     try { mirror.root.remove(); } catch (e) {}
     document.documentElement.classList.remove('gridx-mirror-on');
     mirror = null;
   }
 
+  // How far down does the site's own pinned chrome reach? On x.com that is the
+  // sticky "For you / Following" tab strip: 54px that stays put no matter how
+  // far the reader scrolls. Only bars pinned to the top edge RIGHT NOW count -
+  // the composer is sticky too, but it scrolls away, and counting it as chrome
+  // is what left a permanent gap for the live feed to show through.
+  function pinnedBottom() {
+    let bottom = 0;
+    const consider = (el) => {
+      let cs;
+      try { cs = getComputedStyle(el); } catch (e) { return; }
+      if (cs.position !== 'sticky' && cs.position !== 'fixed') return;
+      let b;
+      try { b = el.getBoundingClientRect(); } catch (e) { return; }
+      if (b.height < 8 || b.height > 220) return;
+      if (b.top > 2 || b.bottom <= 0) return;
+      if (b.bottom > bottom) bottom = b.bottom;
+    };
+    // Walk the feed's own ancestor chain and look only at what sits BEFORE it.
+    // Scanning the whole column would mean a getBoundingClientRect per node on
+    // a page holding thousands of them; the tab strip is always inside an
+    // earlier sibling of one of these ancestors, a subtree of a few dozen.
+    let el = host;
+    let hops = 0;
+    while (el && el !== document.body && hops++ < 14) {
+      for (let sib = el.previousElementSibling; sib; sib = sib.previousElementSibling) {
+        consider(sib);
+        let inner = null;
+        try { inner = sib.querySelectorAll('div, header, nav, section'); } catch (e) {}
+        if (inner) for (let i = 0; i < inner.length && i < 200; i++) consider(inner[i]);
+      }
+      el = el.parentElement;
+    }
+    return Math.round(bottom);
+  }
+
   // Cover the timeline column and the dead space to its right, and start below
-  // whatever the site keeps at the top. Anchoring to <main> covered the whole
-  // window - X's own left nav and tab strip included - which made the page
-  // look broken rather than gridded.
+  // whatever the site keeps pinned at the top. Anchoring to <main> covered the
+  // whole window - X's own left nav and tab strip included - which made the
+  // page look broken rather than gridded.
   function positionMirror() {
     if (!mirror) return;
     const col = document.querySelector('[data-testid="primaryColumn"]') || host;
     let r;
     try { r = col.getBoundingClientRect(); } catch (e) { return; }
-    // The feed's own top edge is the honest place to start: it clears the
-    // header and the tab strip without having to know their heights.
-    let top = 0;
+    // The feed's top edge is the right place to start ONLY while the composer
+    // above it is still on screen. It used to be measured once, at load, and
+    // never again - so the moment the reader scrolled, that same band filled
+    // with the site's real posts sliding past above a grid that never moved.
+    // A live strip of feed on top of a frozen grid is exactly the reported bug;
+    // clamping to the pinned chrome and re-measuring every tick is the fix.
+    const pinned = mirror.pinned || 0;
+    let top = pinned;
     try {
       const hr = host.getBoundingClientRect();
-      top = Math.max(0, Math.min(window.innerHeight - 80, Math.round(hr.top)));
+      top = Math.max(pinned, Math.min(window.innerHeight - 80, Math.round(hr.top)));
     } catch (e) {}
     const left = Math.round(r.left);
+    const width = Math.max(200, Math.round(window.innerWidth - left - 8));
+    if (top === mirror.top && left === mirror.left && width === mirror.width) return;
+    mirror.top = top;
+    mirror.left = left;
+    mirror.width = width;
     mirror.root.style.left = left + 'px';
-    mirror.root.style.width = Math.max(200, Math.round(window.innerWidth - left - 8)) + 'px';
+    mirror.root.style.width = width + 'px';
     mirror.root.style.top = top + 'px';
-    mirror.root.style.height = (window.innerHeight - top) + 'px';
+    mirror.root.style.height = Math.max(80, window.innerHeight - top) + 'px';
     try {
       mirror.root.style.background = getComputedStyle(document.body).backgroundColor || '#fff';
     } catch (e) {}
@@ -743,6 +796,8 @@
         mirror.obs.disconnect();
         mirror.obs.observe(host, { childList: true, subtree: true });
       }
+      mirror.pinned = pinnedBottom();
+      mirror.top = null;
       positionMirror();
       log('mirror re-attached to a rebuilt feed container');
     }
@@ -795,9 +850,44 @@
     return tallest * ROW_UNIT;
   }
 
-  // The page's scroll range belongs to the site's virtual height, which is far
-  // longer than the grid it produces. Map one onto the other so a full scroll
-  // of the page walks the whole grid.
+  // Whatever element the page really scrolls, read the position from there.
+  function pageScrollTop() {
+    let best = 0;
+    const els = [document.documentElement, document.body, host];
+    for (const el of els) {
+      if (!el) continue;
+      try { if (el.scrollTop > best) best = el.scrollTop; } catch (e) {}
+    }
+    return best;
+  }
+
+  // Where in the feed is the reader? The site's own mounted cells answer that
+  // exactly, and matching the topmost one to its clone beats mapping scroll
+  // fractions: the site's scroll height is its VIRTUAL height and bears no
+  // fixed relation to the height of the grid collected so far, so the fraction
+  // drifted every time X extended its range. Returns -1 when nothing mounted
+  // has been captured yet.
+  function mirrorAnchorOffset() {
+    if (!mirror || !host) return -1;
+    const edge = (mirror.top || 0) + 4;
+    let best = null;
+    for (const cell of host.children) {
+      if (!isEl(cell)) continue;
+      let b;
+      try { b = cell.getBoundingClientRect(); } catch (e) { continue; }
+      if (b.height < 4 || b.bottom <= edge) continue;
+      if (best && b.top >= best.top) continue;
+      let art = null;
+      try { art = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE); } catch (e) { continue; }
+      if (!art) continue;
+      const key = cellKey(cell, art);
+      const clone = key ? mirror.seen.get(key) : null;
+      if (!clone) continue;
+      best = { top: b.top, clone: clone };
+    }
+    return best ? Math.max(0, best.clone.offsetTop) : -1;
+  }
+
   // Scrolling used to re-measure and re-place every clone on each tick - up to
   // 400 getBoundingClientRect calls plus 1200 style writes per 80ms, which is
   // exactly the "slow and glitchy" scroll. Placement only changes when cells
@@ -805,15 +895,26 @@
   // nothing else.
   function syncMirror(repack) {
     if (!mirror) return;
+    positionMirror();
     const added = captureIntoMirror();
     if (repack || added) mirror.gridH = packMirror();
     const gridH = mirror.gridH || 0;
     const viewH = mirror.root.clientHeight || window.innerHeight;
-    const doc = document.documentElement;
-    const pageRange = Math.max(1, doc.scrollHeight - window.innerHeight);
     const gridRange = Math.max(0, gridH - viewH);
-    const f = Math.min(1, Math.max(0, (doc.scrollTop || document.body.scrollTop || 0) / pageRange));
-    mirror.inner.style.transform = 'translateY(' + (-Math.round(f * gridRange)) + 'px)';
+    let y = mirrorAnchorOffset();
+    if (y < 0) {
+      // Fall back to the page's own scroll fraction, via pageScrollRange()
+      // rather than documentElement: on live x.com <html> is exactly viewport
+      // height with zero range, so the old ratio was 0/1 forever and the
+      // transform never left translateY(0).
+      const range = Math.max(1, pageScrollRange());
+      y = Math.min(1, Math.max(0, pageScrollTop() / range)) * gridRange;
+    }
+    const offset = Math.round(Math.min(gridRange, Math.max(0, y)));
+    if (offset !== mirror.offset) {
+      mirror.offset = offset;
+      mirror.inner.style.transform = 'translateY(' + (-offset) + 'px)';
+    }
     stats.postsRendered = mirror.seen.size;
     updateStatsReadout();
   }
