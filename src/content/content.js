@@ -345,12 +345,14 @@
   // make the host look like a scroller and the answer would always be yes.
   let hostWasScroller = false;
 
-  // How much scroll range does the PAGE actually have? Asking documentElement
-  // alone is wrong: on live x.com <html> is exactly viewport-height with no
-  // range at all, and <body> is the element that scrolls (measured: html
-  // scrollHeight 678 === clientHeight, body scrollHeight 1540 / clientHeight
-  // 678). A guard that read only documentElement therefore concluded "this
-  // page cannot scroll" about a page that scrolls perfectly well.
+  // How much scroll range does the PAGE actually have? Ask every candidate,
+  // because which element owns the scroll is not knowable per-site: x.com
+  // scrolls <html>, Reddit scrolls the document, and a feed container can own
+  // it outright. GridX once recorded "x.com scrolls <body>" as a site fact and
+  // built guards around it; it was self-inflicted - the stylesheet clipped
+  // body's overflow-x, which under the CSS spec forces overflow-y to auto and
+  // makes body a scroller. Reading all three costs nothing and cannot be
+  // wrong-footed that way again.
   function pageScrollRange() {
     let best = 0;
     const els = [document.documentElement, document.body, host];
@@ -427,12 +429,46 @@
     return Math.max(1, Math.min(requested, fits));
   }
 
+  // Density / font-scale as CSS vars cascading into articles, plus the
+  // switches the stylesheet reads off <html>. Everything here is layout-model
+  // agnostic, which is why both the in-place grid and the mirror can call it.
+  function applyDisplayFlags() {
+    const fs = clampNum(settings.fontScale, 0.8, 1.4);
+    document.documentElement.style.setProperty('--gx-font-scale', fs.toFixed(2));
+    document.documentElement.style.setProperty('--gx-density', densityScale().toFixed(2));
+    document.documentElement.classList.toggle('gx-hide-avatar', settings.showAvatars === false);
+    document.documentElement.classList.toggle('gx-hide-media', settings.showMedia === false);
+    document.documentElement.classList.toggle('gx-hide-metrics', settings.showMetrics === false);
+    document.documentElement.classList.toggle('gx-hide-promoted', !!settings.hidePromoted);
+    document.documentElement.classList.toggle('gx-hide-rt', !!settings.hideRetweets);
+    document.documentElement.classList.toggle('gx-hide-verified', !!settings.hideVerified);
+    document.documentElement.classList.toggle('gx-bleed', !!settings.bleed);
+  }
+
   function applyGrid() {
     if (!host) return;
     // Re-checked here as well as at activation: the site may not have reserved
     // its virtual height yet when we first looked, and applyGrid runs again
     // whenever the health watchdog re-attaches to a rebuilt feed.
-    if (isTransformVirtualized(host)) { restoreHost(); untagWidenChain(); startMirror(); return; }
+    if (isTransformVirtualized(host)) {
+      restoreHost();
+      untagWidenChain();
+      // The reader's display settings are applied on BOTH paths. They used to
+      // live below this return, so on x.com - the only site that reaches mirror
+      // mode - density, font scale and the avatar/media/metric switches were
+      // all inert: the grid rendered full-size posts with their images even
+      // though showMedia defaults to false. Four untouched posts side by side
+      // is not a high-density dashboard.
+      applyDisplayFlags();
+      applyScanClass();
+      // Re-entry must not rebuild. applyGrid runs again on every settings
+      // change and from the health watchdog, and startMirror() drops every
+      // clone collected so far - so the grid would silently reset to whatever
+      // the site happens to have mounted at that moment.
+      if (mirror) { applyMirrorColumns(); scheduleMirror(true); }
+      else startMirror();
+      return;
+    }
     const requested = clampInt(settings.columnCount, 1, 8);
     const cols = fittedColumns(requested);
     if (cols !== requested) {
@@ -472,17 +508,7 @@
       setInline('overflowX', 'hidden');
     }
 
-    // Density / font-scale as CSS vars cascading into articles.
-    const fs = clampNum(settings.fontScale, 0.8, 1.4);
-    document.documentElement.style.setProperty('--gx-font-scale', fs.toFixed(2));
-    document.documentElement.style.setProperty('--gx-density', densityScale().toFixed(2));
-    document.documentElement.classList.toggle('gx-hide-avatar', settings.showAvatars === false);
-    document.documentElement.classList.toggle('gx-hide-media', settings.showMedia === false);
-    document.documentElement.classList.toggle('gx-hide-metrics', settings.showMetrics === false);
-    document.documentElement.classList.toggle('gx-hide-promoted', !!settings.hidePromoted);
-    document.documentElement.classList.toggle('gx-hide-rt', !!settings.hideRetweets);
-    document.documentElement.classList.toggle('gx-hide-verified', !!settings.hideVerified);
-    document.documentElement.classList.toggle('gx-bleed', !!settings.bleed);
+    applyDisplayFlags();
 
     // A virtualized feed positions its cells absolutely and places them with a
     // transform (X does exactly this). Absolutely positioned children are OUT
@@ -641,6 +667,13 @@
     root.id = 'gridx-mirror';
     const inner = document.createElement('div');
     inner.id = 'gridx-mirror-inner';
+    // Everything the stylesheet knows about a grid cell - wrapping, density,
+    // the avatar/media/metric switches, the ellipsised nowrap metadata - is
+    // written against `.gx-stream`. The mirror IS the grid here, so it carries
+    // the same class rather than growing a parallel copy of all of it. Nothing
+    // else answers to that class in mirror mode: restoreHost() takes it off
+    // the site's own container on the way in.
+    inner.classList.add('gx-stream');
     root.appendChild(inner);
     document.body.appendChild(root);
     mirror = { root: root, inner: inner, seen: new Map(), order: [], main: main };
@@ -739,7 +772,10 @@
       top = Math.max(pinned, Math.min(window.innerHeight - 80, Math.round(hr.top)));
     } catch (e) {}
     const left = Math.round(r.left);
-    const width = Math.max(200, Math.round(window.innerWidth - left - 8));
+    // clientWidth, not innerWidth: innerWidth counts the scrollbar, so the
+    // overlay reached under it and painted its background over the track.
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const width = Math.max(200, Math.round(vw - left - 8));
     if (top === mirror.top && left === mirror.left && width === mirror.width) return;
     mirror.top = top;
     mirror.left = left;
@@ -1021,6 +1057,11 @@
   }
 
   function articles() {
+    // In mirror mode the feed the reader sees is the mirror, not the site's
+    // own mounted window. Filtering the host instead hid posts nobody could
+    // see and left the grid untouched, and the post count reported the ~8
+    // cells X had mounted rather than the set collected.
+    if (mirror) return Array.from(mirror.inner.children);
     return host ? Array.from(host.querySelectorAll(ARTICLE)) : [];
   }
 
@@ -1769,8 +1810,7 @@
   function invalidateList() { listCache = null; }
   function list() {
     if (listCache) return listCache;
-    listCache = (host ? Array.from(host.querySelectorAll(ARTICLE)) : [])
-      .filter((a) => !a.classList.contains('gx-hidden'));
+    listCache = articles().filter((a) => !a.classList.contains('gx-hidden'));
     return listCache;
   }
   function idx(a, l) { return (l || list()).indexOf(a); }
@@ -1783,6 +1823,10 @@
     if (!a) return;
     if (cursorArticle) cursorArticle.classList.remove('gx-cursor');
     cursorArticle = a; a.classList.add('gx-cursor');
+    // A mirrored cell must never be scrolled to: the overlay does not scroll,
+    // so the browser would satisfy the request by scrolling the PAGE, which
+    // moves the site's feed under the grid and drags the grid along with it.
+    if (mirror && mirror.inner.contains(a)) return;
     // scrollIntoView forces layout; skip it when the post is already on screen.
     if (!fullyVisible(a)) a.scrollIntoView({ block: 'nearest' });
   }

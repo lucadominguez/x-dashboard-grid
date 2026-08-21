@@ -24,8 +24,22 @@
 html.gridx-active,
 html.gridx-active body {
   scroll-behavior: auto !important;
-  /* Never a horizontal scrollbar: once the document owns the vertical scroll,
-     its scrollbar can push a 100%-width child a few px past the viewport. */
+}
+/* Never a horizontal scrollbar: once the document owns the vertical scroll, its
+   scrollbar can push a 100%-width child a few px past the viewport. The ROOT is
+   the only place this may be said. Naming <body> too gave x.com TWO vertical
+   scrollbars, and the mechanism is a rule in the CSS spec rather than anything
+   to do with X: an overflow-x that is not `visible` forces the computed
+   overflow-y to `auto`, so clipping the body horizontally quietly turned it
+   into its own scroll container. Measured at a 1280px viewport - with <body>
+   in this rule, html clientWidth 1265 / body clientWidth 1250 (two bars) and
+   the html scroll range collapsed to 0, leaving x.com's own permanently
+   visible `overflow-y: scroll` track dead beside a live one; with the root
+   alone, both are 1265, one bar, and the html range is the real 10409. It also
+   put GridX's scroll handling on a false footing, because the page then really
+   did scroll <body> - a fact GridX had measured, recorded and coded against
+   without noticing it had caused it. */
+html.gridx-active {
   overflow-x: hidden !important;
 }
 /* Only when the feed container is genuinely the scroller. x.com scrolls the
@@ -165,9 +179,15 @@ html.gridx-active.gx-hide-avatar .gx-stream [data-testid="UserAvatar-Container"]
 html.gridx-active.gx-hide-avatar .gx-stream [data-testid="Tweet-User-Avatar"],
 html.gridx-scan .gx-stream [data-testid="UserAvatar-Container"] { display: none !important; }
 
+/* card.wrapper is X's link preview. It was not in this list, and in the grid it
+   is the single biggest waste of a cell: a mirrored clone cannot load the
+   card's lazy image at all, so "no media" still left a 250px empty box with a
+   domain caption under it. Measured on the live feed: 3 of 11 cells. */
 html.gridx-active.gx-hide-media .gx-stream [data-testid="tweetPhoto"],
 html.gridx-active.gx-hide-media .gx-stream [data-testid="videoPlayer"],
+html.gridx-active.gx-hide-media .gx-stream [data-testid="card.wrapper"],
 html.gridx-scan .gx-stream [data-testid="tweetPhoto"],
+html.gridx-scan .gx-stream [data-testid="card.wrapper"],
 html.gridx-scan .gx-stream [data-testid="videoPlayer"] { display: none !important; }
 
 html.gridx-active.gx-hide-metrics .gx-stream [role="group"],
@@ -302,6 +322,10 @@ html.gridx-active .gx-stream > *:hover > .gx-expand,
    that stops X mounting posts. Only take cells that are already in flow. */
 html.gridx-active.gridx-site-reddit .gx-stream > *,
 html.gridx-active.gx-unvirtualized .gx-stream > * { position: relative; }
+/* A mirrored cell is a CLONE in GridX's own grid, not one of the site's
+   virtualized cells, so the warning above does not reach it: nothing the
+   site's loader measures is affected by positioning a copy. */
+html.gridx-active #gridx-mirror-inner > * { position: relative; }
 
 /* --- Narrow columns: keep the action row inside the cell. ----------------
    At six columns on a 1280px viewport a cell is ~197px and the vote / comment
