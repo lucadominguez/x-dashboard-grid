@@ -359,6 +359,19 @@ html.gridx-active .gx-stream [role="group"] { flex-wrap: wrap !important; }
   html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.74; }
   html.gridx-active .gx-stream .thing.link { zoom: 0.82; }
 }
+/* Seven and eight columns land here, and the vote/comment/share row is built
+   in a shadow root that no stylesheet can reach into - scaling the host is the
+   only lever that crosses the boundary, so the steps have to keep going. */
+@container (max-width: 190px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.66; }
+  html.gridx-active .gx-stream .thing.link { zoom: 0.74; }
+}
+@container (max-width: 155px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.58; }
+  html.gridx-active .gx-stream .thing.link { zoom: 0.66; }
+}
 
 /* Reddit pads each post 16px on both sides. Inside a grid cell that is 32px of
    a column spent on whitespace the grid gap already provides, and it is what
@@ -569,6 +582,14 @@ html.gridx-active .gx-stream *,
   row-gap: 0;
   grid-auto-rows: 4px;
   will-change: transform;
+}
+/* A narrow column scales the whole post rather than breaking it up. The
+   factor is computed in JS from the real column width (applyMirrorColumns),
+   because GridX knows that width exactly and a container query would only
+   approximate it in steps. `zoom`, not `transform: scale()`: zoom changes the
+   space the cell actually takes, which is what the grid packs against. */
+#gridx-mirror-inner > * {
+  zoom: var(--gx-cell-zoom, 1);
 }
 #gridx-mirror-inner > * {
   pointer-events: auto;

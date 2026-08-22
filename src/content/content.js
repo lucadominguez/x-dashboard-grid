@@ -52,7 +52,7 @@
   // build is running. Chrome serves an unpacked extension's content script
   // from its own cache, so an edit on disk is not necessarily the code in the
   // tab - a whole debugging session was spent measuring the old build.
-  const BUILD = '0.3.0+mirror3';
+  const BUILD = '0.3.0+mirror4';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
 
@@ -111,9 +111,11 @@
       // and centres MAIN's single flex child. Hiding the rails does not lift
       // either, so the whole ancestor chain has to be widened by hand.
       widenChain: true,
-      // An absolute floor, not a comfort preference: below this X's avatar
-      // gutter and action row leave no room for text at all.
-      minColumn: 260,
+      // A legibility floor, not a fit one: a narrow column now SCALES the
+      // whole post (see applyMirrorColumns), so the question is no longer
+      // whether a post fits but whether it can still be read. 150px at the
+      // 0.6 floor is a post rendered at 250px and shown at 150.
+      minColumn: 150,
       // A grid of one post is not a grid. /status/ is the permalink view and
       // /i/ covers the photo and modal routes X opens on top of it.
       feedRoute: (p) => !/\/status\/\d+/.test(p) && !/^\/i\//.test(p),
@@ -664,6 +666,8 @@
    * nothing, since X responds to trusted input only.
    * ------------------------------------------------------------------ */
   const MIRROR_CAP = 400;   // clones retained before the oldest are dropped
+  // The width a post wants. Narrower than this it is scaled, not refused.
+  const COMFORT_COLUMN = 260;
   let mirror = null;
 
   function startMirror() {
@@ -700,8 +704,9 @@
           const box = e.borderBoxSize && e.borderBoxSize[0];
           const h = Math.round(box ? box.blockSize : (e.contentRect ? e.contentRect.height : 0));
           if (!h) continue;
-          if (Math.abs((heights.get(e.target) || 0) - h) < 2) continue;
-          heights.set(e.target, h);
+          if (Math.abs((rawHeights.get(e.target) || 0) - h) < 2) continue;
+          rawHeights.set(e.target, h);
+          dirtyCells.add(e.target);
           changed = true;
         }
         if (changed) scheduleMirror(true);
@@ -822,10 +827,29 @@
     const cols = Math.max(1, Math.min(requested, fits));
     mirror.cols = cols;
     mirror.gap = gap;
+    // Below ~260px a post stops fitting: X's header collapses to a bare badge
+    // and timestamp with the display name gone, and the action row runs past
+    // the cell edge. Refusing the column was one answer, and it is why asking
+    // for six columns silently gave four. Scaling the whole post is a better
+    // one - it keeps every proportion, so a narrow column reads as a smaller
+    // post rather than a broken one. Safe here in a way it never was on X's
+    // own cells: these clones are in normal flow inside GridX's own grid.
+    const colW = (w - gap * (cols - 1)) / cols;
+    const prevW = mirror.colW; const prevZoom = mirror.zoom;
+    mirror.colW = colW;
+    const zoom = colW >= COMFORT_COLUMN ? 1 : Math.max(0.6, colW / COMFORT_COLUMN);
+    mirror.zoom = zoom;
+    mirror.inner.style.setProperty('--gx-cell-zoom', zoom.toFixed(3));
     stats.columnCount = cols;
     stats.effectiveColumns = cols;
     mirror.inner.style.gridTemplateColumns = 'repeat(' + cols + ', minmax(0, 1fr))';
     mirror.inner.style.columnGap = gap + 'px';
+    // Every cell just changed width (and possibly zoom), so every cached
+    // height is stale. Mark them, do not measure here: the read pass in
+    // packMirror does it in one go, after all the writes.
+    if (prevW !== colW || prevZoom !== zoom) {
+      for (const cell of mirror.inner.children) dirtyCells.add(cell);
+    }
   }
 
   // Walk the feed's own cells rather than every <article>: a quoted post is an
@@ -849,12 +873,20 @@
   // long tasks totalling 356ms for a single ten-tick scroll holding only 19
   // clones, and the cost grows with everything the session collects.
   const heights = new WeakMap();
+  const rawHeights = new WeakMap();
+  let dirtyCells = new Set();
   function measureNewCells() {
     if (!mirror) return;
-    const pending = [];
-    for (const cell of mirror.inner.children) if (!heights.has(cell)) pending.push(cell);
+    const todo = [];
+    for (const cell of mirror.inner.children) if (!heights.has(cell)) todo.push(cell);
+    for (const cell of dirtyCells) if (cell.isConnected) todo.push(cell);
+    dirtyCells.clear();
+    // getBoundingClientRect, not offsetHeight: a cell in a narrow column is
+    // ZOOMED, and offsetHeight reports the height before the zoom while the
+    // grid lays out the height after it. Measuring the wrong one leaves a
+    // proportional gap under every cell.
     // Reads only - no style is written until the loop is over.
-    for (const cell of pending) heights.set(cell, cell.offsetHeight || 0);
+    for (const cell of todo) heights.set(cell, cell.getBoundingClientRect().height || 0);
   }
 
   // A post is cloned the instant it mounts, and at that moment X has usually
@@ -1525,12 +1557,28 @@
       onExpandClick(expander.parentElement);
       return;
     }
-    // Let X handle links, buttons, media controls, inputs natively.
+    // A clone carries NONE of the site's handlers. Its role="link" wrappers,
+    // its like button, its tabindex containers and its images are inert
+    // markup, so treating them as "interactive, let the site deal with it"
+    // meant a click on almost any part of a mirrored post did nothing at all -
+    // and most of a post's surface is one of those. Only a real <a href> can
+    // still act for itself here; everything else opens the post.
+    const cell = e.target.closest && e.target.closest('.gx-mirror-cell');
+    if (cell) {
+      if (e.target.closest('a[href]')) return;
+      const own = cell.dataset.gxUrl || (SITE ? SITE.permalink(cell) : '');
+      if (!own) return;
+      e.preventDefault();
+      e.stopPropagation();
+      openTab(own);
+      return;
+    }
+    // Let the site handle links, buttons, media controls, inputs natively.
     const interactive = e.target.closest(
       'a, [role="link"], [role="button"], button, [tabindex], input, textarea, video, audio, img, select'
     );
     if (interactive) return;
-    const art = e.target.closest('.gx-mirror-cell') || e.target.closest(ARTICLE);
+    const art = e.target.closest(ARTICLE);
     if (!art) return;
     const url = art.dataset.gxUrl || (SITE ? SITE.permalink(art) : '');
     if (!url) return;
