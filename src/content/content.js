@@ -48,6 +48,11 @@
   const CLASS_SCAN = 'gridx-scan';
   const CLASS_UNVIRT = 'gx-unvirtualized';
   const CLASS_LOCK = 'gx-lock-scroll';
+  // Stamped on <html> so it is possible to tell, from the page itself, WHICH
+  // build is running. Chrome serves an unpacked extension's content script
+  // from its own cache, so an edit on disk is not necessarily the code in the
+  // tab - a whole debugging session was spent measuring the old build.
+  const BUILD = '0.3.0+mirror2';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
 
@@ -203,6 +208,7 @@
 
   const stats = { postsRendered: 0, postsFiltered: 0, gridActiveMs: 0, columnCount: 3 };
 
+  try { document.documentElement.dataset.gridxBuild = BUILD; } catch (e) {}
   const log = (...a) => { if (settings.debug) console.log('[' + NS + ']', ...a); };
   const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number(v) || lo)));
   const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
@@ -684,9 +690,26 @@
     captureIntoMirror();
     syncMirror(true);
     if (typeof ResizeObserver !== 'undefined') {
-      mirror.sizes = new ResizeObserver(() => scheduleMirror(true));
+      // The observer already carries the new size, so take the number from it
+      // rather than measuring again, and ignore sub-pixel noise: X rewrites a
+      // post's relative timestamp and hover state constantly, and every one of
+      // those used to cost a full re-measure of the whole collection.
+      mirror.sizes = new ResizeObserver((entries) => {
+        let changed = false;
+        for (const e of entries) {
+          const box = e.borderBoxSize && e.borderBoxSize[0];
+          const h = Math.round(box ? box.blockSize : (e.contentRect ? e.contentRect.height : 0));
+          if (!h) continue;
+          if (Math.abs((heights.get(e.target) || 0) - h) < 2) continue;
+          heights.set(e.target, h);
+          changed = true;
+        }
+        if (changed) scheduleMirror(true);
+      });
     }
-    mirror.obs = new MutationObserver(() => scheduleMirror(true));
+    // A mutation means "look for new posts", not "re-place every post": the
+    // repack now happens only when capture actually adds or refreshes one.
+    mirror.obs = new MutationObserver(() => scheduleMirror(false));
     if (host) mirror.obs.observe(host, { childList: true, subtree: true });
     mirror.onScroll = () => scheduleMirror();
     // Scroll events do not bubble, and x.com scrolls <body> rather than the
@@ -819,6 +842,54 @@
     return t ? 'txt:' + t : '';
   }
 
+  // Heights are read ONCE per clone, in a pass that writes nothing, and after
+  // that they come from the ResizeObserver's own numbers. packMirror used to
+  // call getBoundingClientRect on every clone and write its placement right
+  // after each read, which forces a synchronous layout per cell: measured 4
+  // long tasks totalling 356ms for a single ten-tick scroll holding only 19
+  // clones, and the cost grows with everything the session collects.
+  const heights = new WeakMap();
+  function measureNewCells() {
+    if (!mirror) return;
+    const pending = [];
+    for (const cell of mirror.inner.children) if (!heights.has(cell)) pending.push(cell);
+    // Reads only - no style is written until the loop is over.
+    for (const cell of pending) heights.set(cell, cell.offsetHeight || 0);
+  }
+
+  // A post is cloned the instant it mounts, and at that moment X has usually
+  // not filled in the avatar or the photo yet. Measured on the live account:
+  // 16 clones holding 8 <img> between them, from live posts carrying three to
+  // five EACH - which is why the grid showed grey avatar circles and empty
+  // white media boxes and never healed. While the source post is still
+  // mounted, take the picture again.
+  const REFRESH_LIMIT = 4;
+  function refreshClone(clone, art, key) {
+    const tries = clone.__gxRefresh || 0;
+    if (tries >= REFRESH_LIMIT) return false;
+    let live = 0, mine = 0;
+    try {
+      live = art.querySelectorAll('img').length;
+      mine = clone.querySelectorAll('img').length;
+    } catch (e) { return false; }
+    if (live <= mine) return false;
+    let next;
+    try { next = art.cloneNode(true); } catch (e) { return false; }
+    next.classList.add('gx-mirror-cell');
+    next.__gxRefresh = tries + 1;
+    if (clone.dataset.gxUrl) next.dataset.gxUrl = clone.dataset.gxUrl;
+    // Keep the cell where it already sits; only its height is now unknown.
+    next.style.gridColumnStart = clone.style.gridColumnStart;
+    next.style.gridRowStart = clone.style.gridRowStart;
+    next.style.gridRowEnd = clone.style.gridRowEnd;
+    if (mirror.sizes) { try { mirror.sizes.unobserve(clone); } catch (e) {} }
+    try { clone.replaceWith(next); } catch (e) { return false; }
+    heights.delete(next);
+    mirror.seen.set(key, next);
+    if (mirror.sizes) { try { mirror.sizes.observe(next); } catch (e) {} }
+    return true;
+  }
+
   function captureIntoMirror() {
     if (!mirror) return 0;
     // A detached node emits no mutations ever again, so if the site swapped its
@@ -844,7 +915,9 @@
       try { art = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE); } catch (e) { continue; }
       if (!art) continue;
       const key = cellKey(cell, art);
-      if (!key || mirror.seen.has(key)) continue;
+      if (!key) continue;
+      const have = mirror.seen.get(key);
+      if (have) { if (refreshClone(have, art, key)) added++; continue; }
       let clone;
       try { clone = art.cloneNode(true); } catch (e) { continue; }
       if (key.indexOf('txt:') !== 0) clone.dataset.gxUrl = key;
@@ -869,15 +942,18 @@
     if (!mirror) return 0;
     const cols = mirror.cols || 1;
     const gap = mirror.gap || 8;
+    measureNewCells();
     const colRows = new Array(cols).fill(0);
-    let i = 0;
     for (const cell of mirror.inner.children) {
-      let h = 0;
-      try { h = cell.getBoundingClientRect().height; } catch (e) { continue; }
+      const h = heights.get(cell) || 0;
       if (!h) continue;
       const span = Math.max(1, Math.ceil((h + gap) / ROW_UNIT));
-      const c = i % cols;
-      i++;
+      // Shortest column, not round robin. Round robin gave every column the
+      // same NUMBER of posts however tall they were, so a column that drew
+      // three photo posts ran a screen and a half past one that drew three
+      // one-liners - those are the blank half-screens in the grid.
+      let c = 0;
+      for (let k = 1; k < cols; k++) if (colRows[k] < colRows[c]) c = k;
       setPlacement(cell, c + 1, colRows[c] + 1, span);
       colRows[c] += span;
     }
@@ -906,22 +982,39 @@
   function mirrorAnchorOffset() {
     if (!mirror || !host) return -1;
     const edge = (mirror.top || 0) + 4;
-    let best = null;
+    const rows = [];
     for (const cell of host.children) {
       if (!isEl(cell)) continue;
       let b;
       try { b = cell.getBoundingClientRect(); } catch (e) { continue; }
-      if (b.height < 4 || b.bottom <= edge) continue;
-      if (best && b.top >= best.top) continue;
+      if (b.height < 4) continue;
       let art = null;
       try { art = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE); } catch (e) { continue; }
       if (!art) continue;
       const key = cellKey(cell, art);
       const clone = key ? mirror.seen.get(key) : null;
       if (!clone) continue;
-      best = { top: b.top, clone: clone };
+      rows.push({ top: b.top, height: b.height, clone: clone });
     }
-    return best ? Math.max(0, best.clone.offsetTop) : -1;
+    if (!rows.length) return -1;
+    rows.sort((a, b) => a.top - b.top);
+    let i = 0;
+    while (i < rows.length - 1 && rows[i].top + rows[i].height <= edge) i++;
+    const cur = rows[i];
+    const nxt = rows[i + 1] || null;
+    const curTop = Math.max(0, cur.clone.offsetTop);
+    // Snapping straight to the anchor's own offset moved the grid ONLY when
+    // the anchor changed - one jump per post, roughly 120px at four columns,
+    // which is exactly the stutter that reads as "glitchy". Carrying the
+    // fraction of the anchor already scrolled past the top edge makes the
+    // grid travel with the wheel instead of behind it.
+    const frac = cur.height > 0
+      ? Math.min(1, Math.max(0, (edge - cur.top) / cur.height))
+      : 0;
+    const nextTop = nxt
+      ? Math.max(curTop, Math.max(0, nxt.clone.offsetTop))
+      : curTop + (heights.get(cur.clone) || 0);
+    return curTop + (nextTop - curTop) * frac;
   }
 
   // Scrolling used to re-measure and re-place every clone on each tick - up to
@@ -1530,7 +1623,11 @@
     hideFatal();
     host = findHost();
     if (!host) {
-      showFatal('GridX: no timeline container found yet. Retrying…');
+      // No dialog while the page is still building its feed. On a cold x.com
+      // load the timeline arrives a second or two after the content script,
+      // and this used to throw a red "feed not found" panel across the column
+      // on every single load, which then disappeared by itself. Say nothing
+      // until the retries are genuinely exhausted.
       scheduleRetry();
       return;
     }

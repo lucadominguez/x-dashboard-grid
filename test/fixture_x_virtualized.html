@@ -46,10 +46,24 @@
 <script>
 const Q = new URLSearchParams(location.search);
 const TOTAL = +(Q.get('posts') || 300);
-const ROW_H = 190;                     // nominal height X assumes per cell
 const NAMES = ['Alice Chen','Bob Rivera','Carol Kim','Dave Ortiz','Erin Wu','Frank Mills'];
 const HANDLES = ['alice','bob','carol','dave','erin','frank'];
+const BODIES = [
+  'short one',
+  'a medium length post that runs onto a second line when the column is narrow',
+  'a long post: ' + 'lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor '.repeat(3),
+];
 const tl = document.getElementById('tl');
+
+// Posts are NOT all the same height on X, and a grid that ignores that is what
+// leaves half-empty columns. Heights here range 150-520px.
+const AV = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='40'%3E%3Ccircle cx='20' cy='20' r='20' fill='%23657786'/%3E%3C/svg%3E";
+const PH = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='300'%3E%3Crect width='600' height='300' fill='%231d9bf0'/%3E%3C/svg%3E";
+const hasPhoto = (i) => i % 3 === 0;
+const H = (i) => 150 + (i % 4) * 60 + (hasPhoto(i) ? 210 : 0);
+const OFF = [];
+let acc = 0;
+for (let i = 0; i < TOTAL; i++) { OFF.push(acc); acc += H(i); }
 
 function cell(i) {
   const c = document.createElement('div');
@@ -57,31 +71,58 @@ function cell(i) {
   // This is the part that breaks a naive grid.
   c.style.position = 'absolute';
   c.style.width = '100%';
-  c.style.transform = 'translateY(' + (i * ROW_H) + 'px)';
+  c.style.transform = 'translateY(' + OFF[i] + 'px)';
   c.dataset.idx = String(i);
   const h = HANDLES[i % HANDLES.length];
   c.innerHTML =
-    '<article data-testid="tweet">' +
+    '<article data-testid="tweet" style="min-height:' + (H(i) - 1) + 'px">' +
       '<div class="av"></div>' +
       '<div><span class="nm">' + NAMES[i % NAMES.length] + '</span> ' +
         '<span class="hd">@' + h + ' &middot; ' + (i % 59 + 1) + 'm</span></div>' +
       '<div class="tw" data-testid="tweetText">post number ' + i +
-        ' about ' + ['grids','latency','coffee','kernels','typography','banana'][i % 6] + '</div>' +
+        ' about ' + ['grids','latency','coffee','kernels','typography','banana'][i % 6] +
+        ' - ' + BODIES[i % BODIES.length] + '</div>' +
       '<a href="/' + h + '/status/' + (100000 + i) + '"><time>now</time></a>' +
       '<div role="group">' +
         '<div data-testid="reply">12</div><div data-testid="retweet">34</div>' +
         '<div data-testid="like">56</div><div data-testid="viewCount">1700</div>' +
       '</div>' +
     '</article>';
+  // X mounts the SHELL of a post first and fills the avatar and any photo in
+  // afterwards. Anything that clones a post the instant it appears therefore
+  // captures a picture-less copy - measured on the live site as 16 clones
+  // holding 8 <img> between them, from posts carrying three to five each.
+  setTimeout(() => {
+    if (!c.isConnected) return;
+    const av = c.querySelector('.av');
+    if (av && !av.firstChild) {
+      const im = document.createElement('img');
+      im.src = AV; im.width = 40; im.height = 40;
+      av.appendChild(im);
+    }
+    if (hasPhoto(i) && !c.querySelector('[data-testid="tweetPhoto"]')) {
+      const box = document.createElement('div');
+      box.setAttribute('data-testid', 'tweetPhoto');
+      const im = document.createElement('img');
+      im.src = PH; im.style.width = '100%'; im.style.height = 'auto';
+      box.appendChild(im);
+      c.querySelector('article').appendChild(box);
+    }
+  }, 140);
   return c;
 }
 
 // X keeps only a window of cells mounted and moves them as you scroll.
 let mounted = new Map();
+function indexAt(y) {
+  let lo = 0, hi = TOTAL - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (OFF[mid] < y) lo = mid + 1; else hi = mid; }
+  return Math.max(0, lo - 1);
+}
 function virtualize() {
   const top = window.scrollY;
-  const first = Math.max(0, Math.floor(top / ROW_H) - 4);
-  const last = Math.min(TOTAL - 1, Math.ceil((top + innerHeight) / ROW_H) + 4);
+  const first = Math.max(0, indexAt(top) - 2);
+  const last = Math.min(TOTAL - 1, indexAt(top + innerHeight) + 2);
   for (const [i, el] of mounted) {
     if (i < first || i > last) { el.remove(); mounted.delete(i); }
   }
@@ -89,7 +130,7 @@ function virtualize() {
     if (!mounted.has(i)) { const c = cell(i); tl.appendChild(c); mounted.set(i, c); }
   }
 }
-tl.style.minHeight = (TOTAL * ROW_H) + 'px';
+tl.style.minHeight = acc + 'px';
 virtualize();
 addEventListener('scroll', virtualize, { passive: true });
 
