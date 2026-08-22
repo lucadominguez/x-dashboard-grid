@@ -108,6 +108,20 @@ def main():
                   len(heights) > 1 and spread <= 0.25,
                   'per-column px: %s, spread %.0f%%' % (cols, spread * 100))
 
+            spill = page.evaluate("""(() => {
+                let worst = 0;
+                for (const c of document.querySelectorAll('.gx-mirror-cell')) {
+                    const cw = c.getBoundingClientRect().width;
+                    for (const im of c.querySelectorAll('img')) {
+                        const w = im.getBoundingClientRect().width;
+                        if (w - cw > worst) worst = Math.round(w - cw);
+                    }
+                }
+                return worst;
+            })()""")
+            check('3b. pictures fit their column', spill <= 2,
+                  'widest overflow %dpx' % spill)
+
             lt = page.evaluate("window.__lt || []")
             worst = max(lt) if lt else 0
             total = sum(lt)

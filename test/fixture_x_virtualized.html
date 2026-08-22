@@ -101,10 +101,15 @@ function cell(i) {
       av.appendChild(im);
     }
     if (hasPhoto(i) && !c.querySelector('[data-testid="tweetPhoto"]')) {
+      // X does not let CSS size its media: it measures its own 600px column in
+      // JavaScript and writes the pixels inline, which is what overflowed a
+      // narrow grid cell once the pictures actually arrived.
       const box = document.createElement('div');
       box.setAttribute('data-testid', 'tweetPhoto');
+      box.style.width = '492px';
+      box.style.height = '246px';
       const im = document.createElement('img');
-      im.src = PH; im.style.width = '100%'; im.style.height = 'auto';
+      im.src = PH; im.style.width = '100%'; im.style.height = '100%';
       box.appendChild(im);
       c.querySelector('article').appendChild(box);
     }

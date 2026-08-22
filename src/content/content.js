@@ -52,7 +52,7 @@
   // build is running. Chrome serves an unpacked extension's content script
   // from its own cache, so an edit on disk is not necessarily the code in the
   // tab - a whole debugging session was spent measuring the old build.
-  const BUILD = '0.3.0+mirror2';
+  const BUILD = '0.3.0+mirror3';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
 
@@ -863,6 +863,28 @@
   // five EACH - which is why the grid showed grey avatar circles and empty
   // white media boxes and never healed. While the source post is still
   // mounted, take the picture again.
+  // X sizes its media boxes in JavaScript, in pixels, against its own 600px
+  // column and writes the numbers inline - a photo arrives in the clone with
+  // width:492px inside a 308px grid cell, and the cell's overflow:hidden then
+  // crops it. Inline styles beat any stylesheet, so trade the fixed box for
+  // its aspect ratio and let the column decide the width. Anything narrower
+  // than an avatar is left alone.
+  function fitMedia(clone) {
+    let boxes;
+    try { boxes = clone.querySelectorAll('[style*="width"]'); } catch (e) { return; }
+    for (const el of boxes) {
+      const w = parseFloat(el.style.width);
+      const h = parseFloat(el.style.height);
+      if (!(w > 120)) continue;
+      if (h > 0) {
+        el.style.aspectRatio = (w / h).toFixed(4);
+        el.style.height = 'auto';
+      }
+      el.style.width = '100%';
+      el.style.maxWidth = '100%';
+    }
+  }
+
   const REFRESH_LIMIT = 4;
   function refreshClone(clone, art, key) {
     const tries = clone.__gxRefresh || 0;
@@ -876,6 +898,7 @@
     let next;
     try { next = art.cloneNode(true); } catch (e) { return false; }
     next.classList.add('gx-mirror-cell');
+    fitMedia(next);
     next.__gxRefresh = tries + 1;
     if (clone.dataset.gxUrl) next.dataset.gxUrl = clone.dataset.gxUrl;
     // Keep the cell where it already sits; only its height is now unknown.
@@ -922,6 +945,7 @@
       try { clone = art.cloneNode(true); } catch (e) { continue; }
       if (key.indexOf('txt:') !== 0) clone.dataset.gxUrl = key;
       clone.classList.add('gx-mirror-cell');
+      fitMedia(clone);
       mirror.seen.set(key, clone);
       mirror.order.push(key);
       mirror.inner.appendChild(clone);
