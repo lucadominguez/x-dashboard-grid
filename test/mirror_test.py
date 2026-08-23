@@ -126,6 +126,31 @@ def main():
                   len(heights) > 1 and spread <= 0.25,
                   'per-column px: %s, spread %.0f%%' % (cols, spread * 100))
 
+            # Nothing may sit in a blank strip: if a cell's placement is
+            # computed from a height the grid does not agree with - the zoom
+            # trap, or a wrong intrinsic size under content-visibility - every
+            # cell gets a gap under it.
+            gaps = page.evaluate(
+                "(() => {"
+                " const byCol = new Map();"
+                " for (const c of document.getElementById('gridx-mirror-inner').children) {"
+                "  const col = c.style.gridColumnStart || '1';"
+                "  const r = c.getBoundingClientRect();"
+                "  if (!r.height) continue;"
+                "  if (!byCol.has(col)) byCol.set(col, []);"
+                "  byCol.get(col).push([r.top, r.bottom]);"
+                " }"
+                " let worst = 0;"
+                " for (const rows of byCol.values()) {"
+                "  rows.sort((a, b) => a[0] - b[0]);"
+                "  for (let i = 1; i < rows.length; i++) {"
+                "   const g = rows[i][0] - rows[i - 1][1];"
+                "   if (g > worst) worst = Math.round(g);"
+                "  }"
+                " } return worst; })()")
+            check('3c. no blank strips between cells', gaps <= 12,
+                  'worst gap %dpx' % gaps)
+
             spill = page.evaluate("""(() => {
                 let worst = 0;
                 for (const c of document.querySelectorAll('.gx-mirror-cell')) {
@@ -225,6 +250,20 @@ def main():
                 "})()")
             check('6. seven columns means seven columns',
                   wide['tracks'] == 7 and wide['used'] == 7, str(wide))
+
+            # Every re-take is a whole post inserted and laid out again -
+            # 3.4ms each, measured on the live feed. Catching up must not mean
+            # re-cloning the same post four times while the reader scrolls.
+            takes = page.evaluate(
+                "(() => {"
+                " let n = 0, extra = 0;"
+                " for (const c of document.querySelectorAll('.gx-mirror-cell')) {"
+                "  n++; extra += (+c.dataset.gxTakes || 1) - 1;"
+                " } return {cells: n, extra: extra}; })()")
+            per = takes['extra'] / max(1, takes['cells'])
+            check('7. a post is not re-cloned over and over', per <= 1.2,
+                  '%d extra takes over %d posts (%.2f each)'
+                  % (takes['extra'], takes['cells'], per))
 
             lt = page.evaluate("window.__lt || []")
             worst = max(lt) if lt else 0

@@ -52,7 +52,7 @@
   // build is running. Chrome serves an unpacked extension's content script
   // from its own cache, so an edit on disk is not necessarily the code in the
   // tab - a whole debugging session was spent measuring the old build.
-  const BUILD = '0.3.0+mirror6';
+  const BUILD = '0.3.0+mirror8';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
 
@@ -715,7 +715,20 @@
     }
     // A mutation means "look for new posts", not "re-place every post": the
     // repack now happens only when capture actually adds or refreshes one.
-    mirror.obs = new MutationObserver(() => scheduleMirror(false));
+    //
+    // It is also the one moment when a post is guaranteed to be FINISHED: X is
+    // unmounting it. Re-taking the copy here, from the node on its way out,
+    // replaces the polling that used to re-clone a post up to four times while
+    // it was still on screen. Measured on the live feed: inserting a cloned
+    // post and laying it out costs 3.4ms, so those extra copies were most of
+    // what made scrolling stutter.
+    mirror.obs = new MutationObserver((muts) => {
+      for (const m of muts) {
+        const gone = m.removedNodes;
+        for (let i = 0; i < gone.length; i++) finalSnapshot(gone[i]);
+      }
+      scheduleMirror(false);
+    });
     if (host) mirror.obs.observe(host, { childList: true, subtree: true });
     mirror.onScroll = () => scheduleMirror();
     // Scroll events do not bubble, and x.com scrolls <body> rather than the
@@ -738,7 +751,11 @@
     mirror.modalTimer = setInterval(() => {
       let open = false;
       try {
-        const d = document.querySelector('[aria-modal="true"]');
+        // Scoped to X's own dialog layer. document.querySelector for a missing
+        // attribute walks the WHOLE tree, and most of that tree is now the
+        // grid's own clones: 8,758 nodes at 46 posts, four times a second.
+        const scope = document.getElementById('layers') || document.body;
+        const d = scope.querySelector('[aria-modal="true"]');
         open = !!(d && d.getBoundingClientRect().width > 100);
       } catch (e) {}
       if (open === mirror.modalOpen) return;
@@ -754,6 +771,7 @@
     if (mirror.obs) mirror.obs.disconnect();
     if (mirror.sizes) mirror.sizes.disconnect();
     if (mirror.modalTimer) clearInterval(mirror.modalTimer);
+    if (catchupTimer) { clearTimeout(catchupTimer); catchupTimer = null; }
     document.removeEventListener('scroll', mirror.onScroll, { capture: true });
     window.removeEventListener('resize', mirror.onResize);
     try { mirror.root.remove(); } catch (e) {}
@@ -891,6 +909,7 @@
   // long tasks totalling 356ms for a single ten-tick scroll holding only 19
   // clones, and the cost grows with everything the session collects.
   const heights = new WeakMap();
+  const offsets = new WeakMap();
   const rawHeights = new WeakMap();
   let dirtyCells = new Set();
   function measureNewCells() {
@@ -920,6 +939,14 @@
   // its aspect ratio and let the column decide the width. Anything narrower
   // than an avatar is left alone.
   function fitMedia(clone) {
+    // The clone's images are second copies of pictures the page has already
+    // decoded once. Off-screen cells are skipped by content-visibility, so
+    // letting the browser defer both the fetch and the decode keeps a burst of
+    // new posts off the main thread during a scroll.
+    try {
+      const imgs = clone.querySelectorAll('img');
+      for (const im of imgs) { im.decoding = 'async'; im.loading = 'lazy'; }
+    } catch (e) {}
     let boxes;
     try { boxes = clone.querySelectorAll('[style*="width"]'); } catch (e) { return; }
     for (const el of boxes) {
@@ -935,7 +962,9 @@
     }
   }
 
-  const REFRESH_LIMIT = 4;
+  // Two, not four: every re-take is a fresh subtree inserted and laid out, and
+  // the snapshot taken as X unmounts the post catches whatever these missed.
+  const REFRESH_LIMIT = 2;
 
   // Is the copy behind the post it came from? Pictures were the obvious case,
   // but TEXT arrives late too: measured on the live feed, a promoted post
@@ -962,6 +991,56 @@
     return false;
   }
 
+  // Comparing a post with its copy means reading two whole subtrees as text,
+  // and X mutates constantly while scrolling, so the check is throttled per
+  // copy and stops once the post has had time to finish arriving.
+  //
+  // The window has to stay SHORT. A first attempt settled a copy after two
+  // quiet looks 600ms apart, and that broke the catching-up entirely on a fast
+  // scroll: X unmounts a post within a tick or two of it leaving the screen,
+  // so the second look never happened and 156 of 165 copies stayed
+  // picture-less. Age is the only safe stopping rule.
+  // A post finishes arriving on its own schedule, and once the reader stops
+  // scrolling X may make no further mutations at all - so the catch-up cannot
+  // depend on something else waking the loop. One timer, one pending at a
+  // time, and it stops as soon as every copy on screen has settled.
+  let catchupTimer = null;
+  function scheduleCatchup() {
+    if (catchupTimer || !mirror) return;
+    catchupTimer = setTimeout(() => {
+      catchupTimer = null;
+      if (mirror) syncMirror(false);
+    }, 400);
+  }
+
+  const SETTLE_AFTER_MS = 4000;
+  function maybeRefresh(clone, art, key) {
+    if (clone.__gxSettled) return false;
+    scheduleCatchup();
+    const now = Date.now();
+    if (clone.__gxNext && now < clone.__gxNext) return false;
+    clone.__gxNext = now + 250;
+    if (!clone.__gxBorn) clone.__gxBorn = now;
+    if (now - clone.__gxBorn > SETTLE_AFTER_MS) { clone.__gxSettled = true; return false; }
+    if (!staleClone(clone, art)) return false;
+    return refreshClone(clone, art, key);
+  }
+
+  // X hands us the node as it unmounts it. It is detached by then, but intact
+  // and complete, which is exactly the copy the grid wants.
+  function finalSnapshot(node) {
+    if (!mirror || !isEl(node)) return;
+    let art = null;
+    try { art = node.matches(ARTICLE) ? node : node.querySelector(ARTICLE); } catch (e) { return; }
+    if (!art) return;
+    const key = cellKey(node, art);
+    const clone = key ? mirror.seen.get(key) : null;
+    if (!clone || clone.__gxFinal) return;
+    clone.__gxFinal = true;
+    if (!staleClone(clone, art)) return;
+    refreshClone(clone, art, key, true);
+  }
+
   function refreshClone(clone, art, key, force) {
     const tries = clone.__gxRefresh || 0;
     if (!force && tries >= REFRESH_LIMIT) return false;
@@ -972,6 +1051,10 @@
     mirror.keyOf.set(next, key);
     fitMedia(next);
     next.__gxRefresh = tries + 1;
+    next.__gxBorn = clone.__gxBorn || Date.now();
+    // On the element, so the cost of the catching-up is visible from outside:
+    // every re-take is a subtree inserted and laid out again.
+    next.dataset.gxTakes = String(tries + 2);
     if (clone.dataset.gxUrl) next.dataset.gxUrl = clone.dataset.gxUrl;
     // Keep the cell where it already sits; only its height is now unknown.
     next.style.gridColumnStart = clone.style.gridColumnStart;
@@ -1068,7 +1151,7 @@
       const key = cellKey(cell, art);
       if (!key) continue;
       const have = mirror.seen.get(key);
-      if (have) { if (refreshClone(have, art, key)) added++; continue; }
+      if (have) { if (maybeRefresh(have, art, key)) added++; continue; }
       let clone;
       try { clone = art.cloneNode(true); } catch (e) { continue; }
       if (key.indexOf('txt:') !== 0) clone.dataset.gxUrl = key;
@@ -1077,6 +1160,7 @@
       fitMedia(clone);
       mirror.seen.set(key, clone);
       mirror.order.push(key);
+      scheduleCatchup();
       mirror.inner.appendChild(clone);
       if (mirror.sizes) mirror.sizes.observe(clone);
       added++;
@@ -1095,18 +1179,34 @@
     if (!mirror) return 0;
     const cols = mirror.cols || 1;
     const gap = mirror.gap || 8;
+    const z = mirror.zoom || 1;
     measureNewCells();
     const colRows = new Array(cols).fill(0);
     for (const cell of mirror.inner.children) {
       const h = heights.get(cell) || 0;
       if (!h) continue;
       const span = Math.max(1, Math.ceil((h + gap) / ROW_UNIT));
-      // Shortest column, not round robin. Round robin gave every column the
-      // same NUMBER of posts however tall they were, so a column that drew
-      // three photo posts ran a screen and a half past one that drew three
-      // one-liners - those are the blank half-screens in the grid.
+      // Where this cell lands, recorded rather than measured later. Reading
+      // clone.offsetTop to find the reader's place forced a layout of the
+      // whole collection on every scroll tick - 8,758 nodes at 46 posts, and
+      // it grows with everything collected since.
       let c = 0;
       for (let k = 1; k < cols; k++) if (colRows[k] < colRows[c]) c = k;
+      offsets.set(cell, colRows[c] * ROW_UNIT);
+      // Off-screen cells cost nothing if the browser is told how tall they
+      // are: content-visibility skips their layout and paint entirely, which
+      // is what keeps a collection of hundreds of posts scrolling. The size
+      // has to be given in the cell's OWN space, before its zoom.
+      const intrinsic = (h / z).toFixed(1) + 'px';
+      if (cell.__gxIntrinsic !== intrinsic) {
+        cell.__gxIntrinsic = intrinsic;
+        cell.style.containIntrinsicBlockSize = intrinsic;
+        cell.classList.add('gx-cv');
+      }
+      // (c is the shortest column, chosen above. Round robin gave every column
+      // the same NUMBER of posts however tall they were, so a column that drew
+      // three photo posts ran a screen and a half past one that drew three
+      // one-liners - those are the blank half-screens in the grid.)
       setPlacement(cell, c + 1, colRows[c] + 1, span);
       colRows[c] += span;
     }
@@ -1155,7 +1255,11 @@
     while (i < rows.length - 1 && rows[i].top + rows[i].height <= edge) i++;
     const cur = rows[i];
     const nxt = rows[i + 1] || null;
-    const curTop = Math.max(0, cur.clone.offsetTop);
+    const cloneTop = (cl) => {
+      const o = offsets.get(cl);
+      return o === undefined ? cl.offsetTop : o;
+    };
+    const curTop = Math.max(0, cloneTop(cur.clone));
     // Snapping straight to the anchor's own offset moved the grid ONLY when
     // the anchor changed - one jump per post, roughly 120px at four columns,
     // which is exactly the stutter that reads as "glitchy". Carrying the
@@ -1165,7 +1269,7 @@
       ? Math.min(1, Math.max(0, (edge - cur.top) / cur.height))
       : 0;
     const nextTop = nxt
-      ? Math.max(curTop, Math.max(0, nxt.clone.offsetTop))
+      ? Math.max(curTop, Math.max(0, cloneTop(nxt.clone)))
       : curTop + (heights.get(cur.clone) || 0);
     return curTop + (nextTop - curTop) * frac;
   }
@@ -1175,15 +1279,42 @@
   // exactly the "slow and glitchy" scroll. Placement only changes when cells
   // are added or one of them resizes, so scrolling now moves the transform and
   // nothing else.
+  // Where the time in a scroll actually goes. Guessing at this cost a round of
+  // "optimisations" that measured the same afterwards, so the loop reports its
+  // own numbers: turn on debug (gridx:update {debug:true}) and read
+  // document.documentElement.dataset.gridxProfile.
+  const prof = { position: 0, capture: 0, pack: 0, anchor: 0, total: 0, ticks: 0 };
+  let profAt = 0;
+  function publishProfile() {
+    const now = Date.now();
+    if (now - profAt < 1000) return;
+    profAt = now;
+    try {
+      document.documentElement.dataset.gridxProfile = JSON.stringify({
+        ticks: prof.ticks,
+        position: Math.round(prof.position),
+        capture: Math.round(prof.capture),
+        pack: Math.round(prof.pack),
+        anchor: Math.round(prof.anchor),
+        total: Math.round(prof.total),
+      });
+    } catch (e) {}
+  }
+
   function syncMirror(repack) {
     if (!mirror) return;
+    const t0 = performance.now();
     positionMirror();
+    const t1 = performance.now();
     const added = captureIntoMirror();
+    const t2 = performance.now();
     if (repack || added) mirror.gridH = packMirror();
+    const t3 = performance.now();
     const gridH = mirror.gridH || 0;
     const viewH = mirror.root.clientHeight || window.innerHeight;
     const gridRange = Math.max(0, gridH - viewH);
     let y = mirrorAnchorOffset();
+    const t4 = performance.now();
     if (y < 0) {
       // Fall back to the page's own scroll fraction, via pageScrollRange()
       // rather than documentElement: on live x.com <html> is exactly viewport
@@ -1199,6 +1330,15 @@
     }
     stats.postsRendered = mirror.seen.size;
     updateStatsReadout();
+    if (settings.debug) {
+      prof.ticks++;
+      prof.position += t1 - t0;
+      prof.capture += t2 - t1;
+      prof.pack += t3 - t2;
+      prof.anchor += t4 - t3;
+      prof.total += performance.now() - t0;
+      publishProfile();
+    }
   }
 
   let mirrorTimer = null;

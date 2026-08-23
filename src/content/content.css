@@ -591,6 +591,14 @@ html.gridx-active .gx-stream *,
 #gridx-mirror-inner > * {
   zoom: var(--gx-cell-zoom, 1);
 }
+/* A cell whose height GridX has actually measured carries that height as its
+   intrinsic size (written inline by packMirror), so the browser can skip the
+   layout and paint of everything off screen and still size the scroll
+   correctly. Without it the cost of a scroll grows with every post the session
+   has ever collected. */
+#gridx-mirror-inner > .gx-cv {
+  content-visibility: auto;
+}
 #gridx-mirror-inner > * {
   pointer-events: auto;
   overflow: hidden;
