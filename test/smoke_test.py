@@ -46,6 +46,7 @@ def find_chrome():
         '/tmp/pw-browsers/*/chrome*',
         '/tmp/pw-browsers/chrome*/chrome-linux64/chrome',
         os.path.expanduser('~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome'),
+        os.path.expandvars(r'%LOCALAPPDATA%\ms-playwright\chromium-*\chrome-win\chrome.exe'),
     ]:
         candidates.extend(glob.glob(pat))
 
@@ -53,7 +54,7 @@ def find_chrome():
         m = re.search(r'chromium-(\d+)', path)
         return int(m.group(1)) if m else 0
     # Executables only; prefer newest Chromium revision.
-    exes = [c for c in candidates if os.path.isfile(c) and os.access(c, os.X_OK)]
+    exes = [c for c in candidates if os.path.isfile(c) and (c.endswith('.exe') or os.access(c, os.X_OK))]
     exes.sort(key=rev)
     if exes:
         return exes[-1]

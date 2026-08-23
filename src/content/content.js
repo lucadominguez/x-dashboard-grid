@@ -1,8 +1,19 @@
 /* ============================================================================
- * GridX content script — "CSS re-flow" architecture
+ * GridX content script - "CSS re-flow" architecture, multi-site
  * ----------------------------------------------------------------------------
- * v0.2: pivot from "DOM hoisting" (moving <article> nodes) to re-flowing X's
- * own timeline IN PLACE via CSS. This is a direct response to two real-world
+ * v0.3: the re-flow engine is site-agnostic and driven by the SITES adapter
+ * table below. X and Reddit are supported; adding a site is one table entry.
+ * Per-site facts that bit us in testing and are now encoded in the adapters:
+ *   - Reddit scrolls the DOCUMENT, X scrolls the feed container. We only take
+ *     over scrolling where the feed is the scroller; locking overflow on Reddit
+ *     freezes the page and strands its infinite-scroll sentinel.
+ *   - Reddit interleaves <hr> separators between entries, so they are excluded
+ *     from feed detection and hidden rather than each occupying a grid cell.
+ *   - Hiding a sidebar is not enough to reclaim its width: its grid TRACK
+ *     survives, so the feed container is told to span every track.
+ *
+ * v0.2: pivot from "DOM hoisting" (moving <article> nodes) to re-flowing the
+ * site's own timeline IN PLACE via CSS. This is a direct response to two real-world
  * failures of the hoisting build on live x.com:
  *
  *   1. RATE-LIMIT/block: hoisting EMPTIES X's timeline container, so X's
@@ -35,8 +46,16 @@
   const NS = 'gridx';
   const CLASS_ACTIVE = 'gridx-active';
   const CLASS_SCAN = 'gridx-scan';
+  const CLASS_UNVIRT = 'gx-unvirtualized';
+  const CLASS_LOCK = 'gx-lock-scroll';
+  // Stamped on <html> so it is possible to tell, from the page itself, WHICH
+  // build is running. Chrome serves an unpacked extension's content script
+  // from its own cache, so an edit on disk is not necessarily the code in the
+  // tab - a whole debugging session was spent measuring the old build.
+  const BUILD = '0.3.0+reading1';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
+  const ACTIVITY_KEY = 'gridxActivity';
 
   /* ------------------------------------------------------------------ *
    * Defaults & layered selector candidates (X churns its markup).
@@ -57,36 +76,120 @@
     scanMode: false,
     bleed: false,
     debug: false,
+    // Keep a local record of which posts were read, for how long, and which
+    // ones were acted on. It never leaves this machine: it lives in the
+    // extension's own storage and is read back by the options page.
+    trackReading: true,
   };
 
-  const S = {
-    primaryColumn: [
-      '[data-testid="primaryColumn"]',
-      'main section',
-      'main[role="main"]',
-    ],
-    article: ['article[data-testid="tweet"]', 'article'],
-    // Stream host candidate edges: containers we must NOT turn into a grid.
-    notHost: [
-      '[data-testid="primaryColumn"]',
-      '[data-testid="sidebarColumn"]',
-      '[data-testid="TopBar"]',
-      '[data-testid="topBar"]',
-      'header',
-      'nav',
-      'main',
-      'body',
-      'html',
-    ],
-    statusLink: ['a[href*="/status/"]'],
-    sponsored: ['a[aria-label*="sponsored"]'],
-    verified: ['[data-testid="icon-verified"]', 'svg[aria-label*="Verified"]'],
-    metricButtons: ['[role="group"] [role="button"]', '[role="button"]'],
-  };
+  /* ------------------------------------------------------------------ *
+   * Site adapters.
+   *
+   * Everything site-specific lives here: which element is a post, where its
+   * permalink comes from, and how to recognise an ad. The rest of GridX is
+   * site-agnostic and drives whichever adapter matches the current hostname.
+   *
+   * Reddit facts these are built on (verified against live www.reddit.com,
+   * not guessed): the feed is <shreddit-feed>; each post is a <shreddit-post>
+   * wrapped in an <article>; ads are <shreddit-ad-post> siblings that are NOT
+   * wrapped; <hr> separators sit between every entry; and the document, not
+   * the feed, owns the scroll.
+   * ------------------------------------------------------------------ */
+  const SITES = [
+    {
+      id: 'x',
+      label: 'X',
+      hosts: /(^|\.)(x|twitter)\.com$/i,
+      post: 'article[data-testid="tweet"], article',
+      // Containers we must never turn into a grid.
+      notHost: [
+        '[data-testid="primaryColumn"]', '[data-testid="sidebarColumn"]',
+        '[data-testid="TopBar"]', '[data-testid="topBar"]',
+        'header', 'nav', 'main', 'body', 'html',
+      ],
+      // Non-post filler among the host's children (excluded from host scoring
+      // and hidden in the grid so it never occupies a cell).
+      filler: '',
+      // X's timeline container is itself the scroller.
+      ownScroller: true,
+      // x.com caps the timeline at 600px on an obfuscated intermediate wrapper
+      // and centres MAIN's single flex child. Hiding the rails does not lift
+      // either, so the whole ancestor chain has to be widened by hand.
+      widenChain: true,
+      // A legibility floor, not a fit one: a narrow column now SCALES the
+      // whole post (see applyMirrorColumns), so the question is no longer
+      // whether a post fits but whether it can still be read. 150px at the
+      // 0.6 floor is a post rendered at 250px and shown at 150.
+      minColumn: 150,
+      // A grid of one post is not a grid. /status/ is the permalink view and
+      // /i/ covers the photo and modal routes X opens on top of it.
+      feedRoute: (p) => !/\/status\/\d+/.test(p) && !/^\/i\//.test(p),
+      permalink: (el) => { const l = el.querySelector('a[href*="/status/"]'); return l ? l.href : ''; },
+      sponsored: (el) => !!el.querySelector('a[aria-label*="sponsored"]'),
+      repost: (el) => /reposted/i.test(el.textContent || ''),
+      verified: (el) => !!el.querySelector('[data-testid="icon-verified"], svg[aria-label*="Verified"]'),
+    },
+    {
+      id: 'reddit',
+      label: 'Reddit',
+      hosts: /(^|\.)reddit\.com$/i,
+      // shreddit (current), plus old.reddit.com's markup.
+      post: 'shreddit-post, shreddit-ad-post, .thing.link',
+      notHost: [
+        'shreddit-app', '#main-content', '.subgrid-container', '.grid-container',
+        'header', 'nav', 'main', 'body', 'html',
+      ],
+      // new.reddit separates entries with <hr>; old.reddit follows every
+      // .thing with an empty <div class="clearleft">. Measured on live
+      // old.reddit.com: 25 posts and 25 clearleft spacers, so a THIRD of the
+      // grid was blank cells and the reading order zigzagged.
+      filler: 'hr, .clearleft',
+      // Reddit scrolls the document; the feed is not a scroller.
+      ownScroller: false,
+      // Reddit's own rails are hidden in CSS; no ancestor cap to lift.
+      widenChain: false,
+      // An absolute floor. 250 was a comfort figure and it silently capped a
+      // request for eight columns at four, which is not a call GridX gets to
+      // make: asking for eight columns is asking for dense, and the scaling
+      // and wrapping rules below are what keep dense legible.
+      minColumn: 120,
+      // /comments/ is Reddit's single-post view on both new and old.
+      feedRoute: (p) => !/\/comments\//.test(p),
+      permalink: (el) => {
+        const a = el.getAttribute && (el.getAttribute('permalink') || el.getAttribute('data-permalink'));
+        if (a) { try { return new URL(a, location.origin).href; } catch (e) {} }
+        const l = el.querySelector('a[href*="/comments/"]');
+        return l ? l.href : '';
+      },
+      sponsored: (el) => el.tagName.toLowerCase() === 'shreddit-ad-post' ||
+        (el.hasAttribute && (el.hasAttribute('promoted') || el.getAttribute('data-promoted') === 'true')),
+      // Reddit has no repost concept in the X sense; crossposts are ordinary posts.
+      repost: () => false,
+      verified: () => false,
+    },
+  ];
 
-  const ARTICLE = S.article.join(', ');
-  const STATUS_LINK = S.statusLink.join(', ');
-  const HIDE_CHROME = S.primaryColumn.join(', ');
+  function detectSite() {
+    const byHost = SITES.find((s) => s.hosts.test(location.hostname));
+    if (byHost) return byHost;
+    // Local fixtures declare which site's markup they emulate:
+    //   <html data-gridx-site="reddit">
+    //
+    // The declaration is REQUIRED. Defaulting to x.com's markup meant GridX
+    // woke up on every page served from localhost - somebody's dev server on
+    // :3080 among them - looked for a timeline that was never going to be
+    // there, and put "GridX: could not find the timeline" across their app.
+    if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+      const want = (document.documentElement.getAttribute('data-gridx-site') || '').toLowerCase();
+      if (!want) return null;
+      return SITES.find((s) => s.id === want) || null;
+    }
+    return null;
+  }
+  const SITE = detectSite();
+
+  const ARTICLE = SITE ? SITE.post : 'article';
+  const FILLER = SITE ? SITE.filler : '';
 
   const SCAN_KEYS = [
     'columnCount', 'density', 'showAvatars', 'showMedia', 'showMetrics', 'fontScale',
@@ -118,6 +221,7 @@
 
   const stats = { postsRendered: 0, postsFiltered: 0, gridActiveMs: 0, columnCount: 3 };
 
+  try { document.documentElement.dataset.gridxBuild = BUILD; } catch (e) {}
   const log = (...a) => { if (settings.debug) console.log('[' + NS + ']', ...a); };
   const clampInt = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.floor(Number(v) || lo)));
   const clampNum = (v, lo, hi) => Math.max(lo, Math.min(hi, Number(v) || lo));
@@ -152,8 +256,18 @@
   function matchesAny(el, sel) { return isEl(el) && el.matches(sel); }
   function selNotHost(el) {
     if (!isEl(el)) return true;
-    for (const s of S.notHost) if (el.matches(s)) return true;
+    for (const s of (SITE ? SITE.notHost : [])) { try { if (el.matches(s)) return true; } catch (e) {} }
     return false;
+  }
+  // The element that actually sits in the grid: walk up from the post to the
+  // host's direct child. On X that is [data-testid="cellInnerDiv"], on Reddit
+  // the <article> wrapping <shreddit-post>. Hiding or measuring the inner post
+  // instead would leave an empty cell behind.
+  function cellOf(post) {
+    if (!host || !isEl(post)) return post;
+    let el = post;
+    while (el.parentElement && el.parentElement !== host) el = el.parentElement;
+    return el.parentElement === host ? el : post;
   }
 
   /* ------------------------------------------------------------------ *
@@ -184,13 +298,14 @@
           <tr><td>f / s / p</td><td>focus filter / scan / pause</td></tr>
           <tr><td>? / Esc</td><td>keymap overlay / close</td></tr>
           <tr><td>Click post</td><td>open the real post in a new tab</td></tr>
+          <tr><td>Site</td><td class="gx-km-site">-</td></tr>
         </table>
         <p class="gx-km-note">Keys are ignored while typing.</p>
       </div>
       <div id="gridx-fatal" hidden>
-        <h1>GridX: timeline not found</h1>
-        <p>GridX could not locate the timeline container on this page.</p>
-        <p>This usually means X shipped a markup change, or you are not on a feed.</p>
+        <h1>GridX: feed not found</h1>
+        <p>GridX could not locate the feed container on this page.</p>
+        <p>This usually means the site shipped a markup change, or you are not on a feed.</p>
         <button id="gridx-fatal-close">Close GridX</button>
       </div>
       <div id="gridx-statusbar"><span class="gx-hints"></span><span class="gx-stats"></span></div>
@@ -201,6 +316,8 @@
     hintsEl = root.querySelector('.gx-hints');
     statsEl = root.querySelector('.gx-stats');
     keymapEl = root.querySelector('#gridx-keymap');
+    const siteCell = root.querySelector('.gx-km-site');
+    if (siteCell) siteCell.textContent = SITE ? SITE.label : 'unsupported';
     fatalEl = root.querySelector('#gridx-fatal');
 
     filterInput.addEventListener('input', () => setKeywordFilter(previewTerms(), true));
@@ -225,16 +342,77 @@
    * ------------------------------------------------------------------ */
   function isStreamHost(el) {
     if (!isEl(el) || selNotHost(el)) return false;
-    const kids = Array.from(el.children);
+    // Separators (Reddit puts an <hr> between every entry) are not content and
+    // must not dilute the ratio below: shreddit-feed is 28 posts among 70
+    // children, which would otherwise fail a naive 50% test.
+    const kids = Array.from(el.children).filter((k) => !(FILLER && k.matches && k.matches(FILLER)));
     if (kids.length < 3) return false;
     let withArticle = 0;
     for (const k of kids) {
-      // A child may be the tweet itself (fixture) or a wrapper that CONTAINS
-      // one (X's [data-testid="cellInnerDiv"]). Check both.
+      // A child may be the post itself (fixture, Reddit ads) or a wrapper that
+      // CONTAINS one (X's [data-testid="cellInnerDiv"], Reddit's <article>).
       if (k.matches && k.matches(ARTICLE)) withArticle++;
       else if (k.querySelector && k.querySelector(ARTICLE)) withArticle++;
     }
     return withArticle >= 2 && withArticle >= kids.length * 0.5;
+  }
+
+  // Which element actually owns the scroll? Guessing this per-site was wrong:
+  // x.com scrolls the DOCUMENT (its timeline is a tall container with a virtual
+  // height), so locking body overflow froze the page outright. Measured once at
+  // activation, BEFORE we touch any styles, because applyGrid would otherwise
+  // make the host look like a scroller and the answer would always be yes.
+  let hostWasScroller = false;
+
+  // How much scroll range does the PAGE actually have? Ask every candidate,
+  // because which element owns the scroll is not knowable per-site: x.com
+  // scrolls <html>, Reddit scrolls the document, and a feed container can own
+  // it outright. GridX once recorded "x.com scrolls <body>" as a site fact and
+  // built guards around it; it was self-inflicted - the stylesheet clipped
+  // body's overflow-x, which under the CSS spec forces overflow-y to auto and
+  // makes body a scroller. Reading all three costs nothing and cannot be
+  // wrong-footed that way again.
+  function pageScrollRange() {
+    let best = 0;
+    const els = [document.documentElement, document.body, host];
+    for (const el of els) {
+      if (!el) continue;
+      try { best = Math.max(best, el.scrollHeight - el.clientHeight); } catch (e) {}
+    }
+    return best;
+  }
+
+  // x.com caps its timeline column at 600px on an intermediate wrapper whose
+  // class is obfuscated, and MAIN centres its single child instead of
+  // stretching it. Both survive hiding the rails, so on a 1280px viewport the
+  // grid rendered 196px columns: post text wrapped after three words, avatars
+  // collapsed to grey squares and the metric row overlapped itself. Tagging
+  // our own ancestor chain lets the stylesheet lift the caps in that path only,
+  // rather than firing !important width rules at the whole document.
+  function tagWidenChain() {
+    if (!host || !SITE || !SITE.widenChain) return;
+    let el = host;
+    let hops = 0;
+    while (el && el !== document.body && hops++ < 12) {
+      el.setAttribute('data-gx-widen', '1');
+      if (el.tagName === 'MAIN') break;
+      el = el.parentElement;
+    }
+  }
+
+  function untagWidenChain() {
+    document.querySelectorAll('[data-gx-widen]')
+      .forEach((el) => el.removeAttribute('data-gx-widen'));
+  }
+
+  function detectScroller(el) {
+    if (!el) return false;
+    try {
+      const cs = getComputedStyle(el);
+      const oy = cs.overflowY;
+      if (oy !== 'auto' && oy !== 'scroll') return false;
+      return el.scrollHeight > el.clientHeight + 20;
+    } catch (e) { return false; }
   }
 
   function findHost() {
@@ -255,9 +433,66 @@
   /* ------------------------------------------------------------------ *
    * Host grid application
    * ------------------------------------------------------------------ */
+  // How many columns will actually READ at this width? Asking for eight columns
+  // in a 1280px window gives 151px cells, and at that width old.reddit spends
+  // 40px on the vote gutter and wraps titles two words to a line - a denser
+  // grid that conveys less, which is the opposite of the point. Honour the
+  // request only as far as the window can carry it.
+  function fittedColumns(requested) {
+    const min = (SITE && SITE.minColumn) || 200;
+    let width = 0;
+    try { width = host.getBoundingClientRect().width; } catch (e) {}
+    if (!width) return requested;
+    const gap = (settings.bleed ? 0 : 6) * densityScale();
+    const fits = Math.floor((width + gap) / (min + gap));
+    return Math.max(1, Math.min(requested, fits));
+  }
+
+  // Density / font-scale as CSS vars cascading into articles, plus the
+  // switches the stylesheet reads off <html>. Everything here is layout-model
+  // agnostic, which is why both the in-place grid and the mirror can call it.
+  function applyDisplayFlags() {
+    const fs = clampNum(settings.fontScale, 0.8, 1.4);
+    document.documentElement.style.setProperty('--gx-font-scale', fs.toFixed(2));
+    document.documentElement.style.setProperty('--gx-density', densityScale().toFixed(2));
+    document.documentElement.classList.toggle('gx-hide-avatar', settings.showAvatars === false);
+    document.documentElement.classList.toggle('gx-hide-media', settings.showMedia === false);
+    document.documentElement.classList.toggle('gx-hide-metrics', settings.showMetrics === false);
+    document.documentElement.classList.toggle('gx-hide-promoted', !!settings.hidePromoted);
+    document.documentElement.classList.toggle('gx-hide-rt', !!settings.hideRetweets);
+    document.documentElement.classList.toggle('gx-hide-verified', !!settings.hideVerified);
+    document.documentElement.classList.toggle('gx-bleed', !!settings.bleed);
+  }
+
   function applyGrid() {
     if (!host) return;
-    const cols = clampInt(settings.columnCount, 1, 8);
+    // Re-checked here as well as at activation: the site may not have reserved
+    // its virtual height yet when we first looked, and applyGrid runs again
+    // whenever the health watchdog re-attaches to a rebuilt feed.
+    if (isTransformVirtualized(host)) {
+      restoreHost();
+      untagWidenChain();
+      // The reader's display settings are applied on BOTH paths. They used to
+      // live below this return, so on x.com - the only site that reaches mirror
+      // mode - density, font scale and the avatar/media/metric switches were
+      // all inert: the grid rendered full-size posts with their images even
+      // though showMedia defaults to false. Four untouched posts side by side
+      // is not a high-density dashboard.
+      applyDisplayFlags();
+      applyScanClass();
+      // Re-entry must not rebuild. applyGrid runs again on every settings
+      // change and from the health watchdog, and startMirror() drops every
+      // clone collected so far - so the grid would silently reset to whatever
+      // the site happens to have mounted at that moment.
+      if (mirror) { applyMirrorColumns(); scheduleMirror(true); }
+      else startMirror();
+      return;
+    }
+    const requested = clampInt(settings.columnCount, 1, 8);
+    const cols = fittedColumns(requested);
+    if (cols !== requested) {
+      setStatus('GridX: ' + requested + ' columns will not read at this width, using ' + cols, 5000);
+    }
     stats.columnCount = cols;
     const gap = (settings.bleed ? 0 : 6) * densityScale();
 
@@ -270,29 +505,926 @@
     setInline('alignContent', 'start');
     setInline('alignItems', 'start');
     setInline('columnGap', gap + 'px');
-    setInline('rowGap', gap + 'px');
-    setInline('overflowY', 'auto');
-    setInline('overflowX', 'hidden');
-    setInline('overscrollBehavior', 'contain');
-    setInline('scrollBehavior', 'auto');
-    // Make sure the grid has room to scroll within the viewport. If the host
-    // is already a scroller (real X), leave its height alone; otherwise (e.g.
-    // the flat fixture `#stream`) constrain it so vertical scrolling works.
-    if (host.scrollHeight <= host.clientHeight) setInline('height', '100vh');
+    // Row gap MUST be zero while the height packing is on. The packing spans a
+    // 4px track per cell, and a row gap is inserted between EVERY track, so a
+    // 107px post spanning 29 tracks occupied 29*4 + 28*6 = 284px. That, not the
+    // packing itself, was the source of the holes down every column. The gap is
+    // instead baked into each cell's span.
+    cellGap = gap;
+    setInline('rowGap', '0px');
+    // Only take over scrolling on sites whose feed container is the scroller.
+    // Reddit scrolls the document: turning shreddit-feed into its own scroller
+    // strands Reddit's infinite-scroll sentinel and kills pagination, so we
+    // leave the page's native scroll model alone there.
+    if (hostWasScroller) {
+      // The feed container really is the scroller: keep it that way.
+      setInline('overflowY', 'auto');
+      setInline('overflowX', 'hidden');
+      setInline('overscrollBehavior', 'contain');
+      setInline('scrollBehavior', 'auto');
+    } else {
+      // The document owns the scroll. Touch nothing that could freeze it.
+      setInline('overflowX', 'hidden');
+    }
 
-    // Density / font-scale as CSS vars cascading into articles.
-    const fs = clampNum(settings.fontScale, 0.8, 1.4);
-    document.documentElement.style.setProperty('--gx-font-scale', fs.toFixed(2));
-    document.documentElement.style.setProperty('--gx-density', densityScale().toFixed(2));
-    document.documentElement.classList.toggle('gx-hide-avatar', settings.showAvatars === false);
-    document.documentElement.classList.toggle('gx-hide-media', settings.showMedia === false);
-    document.documentElement.classList.toggle('gx-hide-metrics', settings.showMetrics === false);
-    document.documentElement.classList.toggle('gx-hide-promoted', !!settings.hidePromoted);
-    document.documentElement.classList.toggle('gx-hide-rt', !!settings.hideRetweets);
-    document.documentElement.classList.toggle('gx-hide-verified', !!settings.hideVerified);
-    document.documentElement.classList.toggle('gx-bleed', !!settings.bleed);
+    applyDisplayFlags();
 
+    // A virtualized feed positions its cells absolutely and places them with a
+    // transform (X does exactly this). Absolutely positioned children are OUT
+    // OF FLOW, so display:grid on the container has nothing to lay out and
+    // every post keeps its original full-width position: the grid appears to
+    // apply and visibly does nothing. Detect that and put the cells back in
+    // flow so the grid can actually place them.
+    if (detectOutOfFlow()) setTimeout(verifyUnvirtualize, 400);
+    // Tiny implicit rows are what let a cell span exactly its own height.
+    setInline('gridAutoRows', ROW_UNIT + 'px');
+    scheduleMasonry();
+    stats.effectiveColumns = measureColumns();
     applyScanClass();
+  }
+
+  // Putting virtualized cells back in flow makes the grid work, but the
+  // container's height was what created the page's scroll range. On a feed that
+  // pages by scroll offset, removing it can leave the page unable to scroll at
+  // all - which is strictly worse than no grid. Verify, and back out if so.
+  let unvirtBlocked = false;
+  // Once a feed has proved it cannot be gridded, stay off it. Without this the
+  // health watchdog and the route watcher both cheerfully re-activate and the
+  // whole cycle runs again on every navigation.
+  let virtualizedGiveUp = false;
+
+  function revertUnvirtualize(reason) {
+    document.documentElement.classList.remove(CLASS_UNVIRT);
+    unvirtBlocked = true;
+    log('unvirtualize reverted:', reason);
+    // Backing out of the unvirtualize alone left the worst of both worlds: the
+    // cells go back to being absolutely positioned so the grid does nothing,
+    // but the feed KEEPS the width we reclaimed for it - which on x.com means
+    // a single column of posts stretched across the whole 1248px window,
+    // measurably worse to read than the site's own centred column. If we
+    // cannot grid the feed we have no business restyling it either, so stand
+    // all the way down and say so plainly.
+    virtualizedGiveUp = true;
+    const label = SITE ? SITE.label : 'this site';
+    deactivate();
+    showFatal('GridX cannot grid ' + label + "'s timeline: the site renders it "
+      + 'virtualized, and its own loader stops feeding posts when the grid takes '
+      + 'over placement. Leaving the site layout untouched.');
+  }
+
+  function verifyUnvirtualize() {
+    if (!active || !host) return;
+    if (!document.documentElement.classList.contains(CLASS_UNVIRT)) return;
+    // The old threshold of 8 posts was unreachable in the only case that
+    // matters: killing the scroll range is exactly what stops more posts
+    // arriving, so the count stays low and the guard never fired. Three posts
+    // is enough to know a feed rendered.
+    const canScroll = pageScrollRange() > 200;
+    const hasMore = articles().length >= 3;
+    if (!canScroll && hasMore) {
+      revertUnvirtualize('it removed the page scroll range');
+      return;
+    }
+    startPaginationWatch();
+  }
+
+  // Losing the scroll range is the loud failure. The quiet one is worse: the
+  // page still scrolls, but the site's virtualizer decides what to mount from
+  // its own model of where each cell sits, and putting the cells back in flow
+  // invalidates that model. Measured on live x.com: scrolling 4000px left the
+  // mounted count pinned at 8 and the unique-post count at 7, with 7000px of
+  // blank container below the last post. Watch for the reader running out of
+  // feed and back out to the site's own layout when they do.
+  let unvirtWatch = null;
+  function startPaginationWatch() {
+    stopPaginationWatch();
+    if (!host) return;
+    const baseline = articles().length;
+    let strikes = 0;
+    unvirtWatch = setInterval(() => {
+      if (!active || !host || !document.documentElement.classList.contains(CLASS_UNVIRT)) {
+        stopPaginationWatch();
+        return;
+      }
+      const last = host.children[host.children.length - 1];
+      if (!last) return;
+      let bottom = 0;
+      try { bottom = last.getBoundingClientRect().bottom; } catch (e) { return; }
+      // Scrolled clean past every mounted post, and nothing new arrived.
+      if (bottom < 0 && articles().length <= baseline) strikes++;
+      else strikes = 0;
+      if (strikes >= 3) {
+        revertUnvirtualize('the feed stopped mounting posts in grid layout');
+        stopPaginationWatch();
+      }
+    }, 1000);
+  }
+
+  function stopPaginationWatch() {
+    if (unvirtWatch) { clearInterval(unvirtWatch); unvirtWatch = null; }
+  }
+
+  // Recognise a transform-virtualizer BEFORE touching the page.
+  //
+  // The watchdog below can only fire once the reader has scrolled past every
+  // mounted post, so it cures the problem after they have already been shown a
+  // broken grid: five columns of one-word-per-line text over five posts that
+  // never grow. The signature is unmistakable up front, and both halves are
+  // needed - absolutely positioned children placed by transform, AND a large
+  // inline min-height on the container, which is the virtual scroll height the
+  // site reserves for posts it has not mounted. Reddit has neither; x.com has
+  // both (measured: min-height 11270px over four mounted cells).
+  function isTransformVirtualized(el) {
+    if (!el) return false;
+    let inlineMinH = 0;
+    try { inlineMinH = parseFloat(el.style.minHeight) || 0; } catch (e) { return false; }
+    if (inlineMinH < 1500) return false;
+    let abs = 0, n = 0;
+    for (const k of el.children) {
+      if (!isEl(k) || n >= 8) break;
+      n++;
+      try {
+        const d = getComputedStyle(k);
+        if ((d.position === 'absolute' || d.position === 'fixed') && d.transform !== 'none') abs++;
+      } catch (e) {}
+    }
+    return n >= 2 && abs >= Math.max(2, n * 0.5);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Mirror mode: the grid for feeds that place their own posts.
+   *
+   * x.com cannot be gridded in place, and this was established by measurement
+   * rather than argument. Its timeline container carries an inline min-height
+   * equal to the virtual scroll height, and every cell is absolutely
+   * positioned by a transform. Move those cells by ANY means - put them back
+   * in flow, or collapse the reserved height so real content fills the scroll
+   * range - and the virtualizer stops feeding: measured 8 posts, frozen,
+   * across 4000px of scrolling in both directions.
+   *
+   * The second measurement is what made a grid possible anyway. On an
+   * UNTOUCHED x.com the mounted count also sits at 8-9, because X unmounts
+   * posts as they leave the viewport; that is its normal steady state, not a
+   * symptom. Unique posts keep arriving as the reader scrolls. So the feed is
+   * not broken - it just never holds more than a screenful at once.
+   *
+   * Mirror mode therefore touches X's timeline not at all. It watches posts
+   * mount, keeps a clone of each one, and paints the accumulated set into its
+   * own grid layered over the column. The overlay takes no pointer events, so
+   * the wheel still reaches X underneath and its virtualizer keeps working on
+   * the reader's own scrolling - which matters, because a content script
+   * cannot drive it: programmatic scrolling moved the page 4800px and mounted
+   * nothing, since X responds to trusted input only.
+   * ------------------------------------------------------------------ */
+  const MIRROR_CAP = 400;   // clones retained before the oldest are dropped
+  // The width a post wants. Narrower than this it is scaled, not refused.
+  const COMFORT_COLUMN = 260;
+  let mirror = null;
+
+  function startMirror() {
+    stopMirror();
+    const main = document.querySelector('main') || document.body;
+    const root = document.createElement('div');
+    root.id = 'gridx-mirror';
+    const inner = document.createElement('div');
+    inner.id = 'gridx-mirror-inner';
+    // Everything the stylesheet knows about a grid cell - wrapping, density,
+    // the avatar/media/metric switches, the ellipsised nowrap metadata - is
+    // written against `.gx-stream`. The mirror IS the grid here, so it carries
+    // the same class rather than growing a parallel copy of all of it. Nothing
+    // else answers to that class in mirror mode: restoreHost() takes it off
+    // the site's own container on the way in.
+    inner.classList.add('gx-stream');
+    root.appendChild(inner);
+    document.body.appendChild(root);
+    mirror = { root: root, inner: inner, seen: new Map(), order: [],
+               keyOf: new WeakMap(), main: main };
+    mirror.pinned = pinnedBottom();
+    positionMirror();
+    applyMirrorColumns();
+    document.documentElement.classList.add('gridx-mirror-on');
+    captureIntoMirror();
+    syncMirror(true);
+    if (typeof ResizeObserver !== 'undefined') {
+      // The observer already carries the new size, so take the number from it
+      // rather than measuring again, and ignore sub-pixel noise: X rewrites a
+      // post's relative timestamp and hover state constantly, and every one of
+      // those used to cost a full re-measure of the whole collection.
+      mirror.sizes = new ResizeObserver((entries) => {
+        let changed = false;
+        for (const e of entries) {
+          const box = e.borderBoxSize && e.borderBoxSize[0];
+          const h = Math.round(box ? box.blockSize : (e.contentRect ? e.contentRect.height : 0));
+          if (!h) continue;
+          if (Math.abs((rawHeights.get(e.target) || 0) - h) < 2) continue;
+          rawHeights.set(e.target, h);
+          dirtyCells.add(e.target);
+          changed = true;
+        }
+        if (changed) scheduleMirror(true);
+      });
+    }
+    // A mutation means "look for new posts", not "re-place every post": the
+    // repack now happens only when capture actually adds or refreshes one.
+    //
+    // It is also the one moment when a post is guaranteed to be FINISHED: X is
+    // unmounting it. Re-taking the copy here, from the node on its way out,
+    // replaces the polling that used to re-clone a post up to four times while
+    // it was still on screen. Measured on the live feed: inserting a cloned
+    // post and laying it out costs 3.4ms, so those extra copies were most of
+    // what made scrolling stutter.
+    mirror.obs = new MutationObserver((muts) => {
+      for (const m of muts) {
+        const gone = m.removedNodes;
+        for (let i = 0; i < gone.length; i++) finalSnapshot(gone[i]);
+      }
+      scheduleMirror(false);
+    });
+    if (host) mirror.obs.observe(host, { childList: true, subtree: true });
+    mirror.onScroll = () => scheduleMirror();
+    // Scroll events do not bubble, and x.com scrolls <body> rather than the
+    // document, so this listener on window never fired ONCE: measured 0 window
+    // events against 1100px of real scrolling, which is why the grid sat frozen
+    // while the feed moved behind it. Capturing on the document sees the scroll
+    // of whichever element the site turns out to use.
+    document.addEventListener('scroll', mirror.onScroll, { passive: true, capture: true });
+    window.addEventListener('resize', mirror.onResize = () => {
+      mirror.pinned = pinnedBottom();
+      mirror.top = null;
+      positionMirror(); applyMirrorColumns(); scheduleMirror(true);
+    }, { passive: true });
+    // X opens its reply composer, its photo viewer and its post menu as a
+    // dialog over the timeline, and the overlay sits above everything at
+    // z-index 9998 - it would cover them, leaving the reader typing into
+    // something they cannot see. Step aside while one is open. A quarter of a
+    // second of polling costs one querySelector; the dialog is portalled deep
+    // inside X's tree, so there is no cheap node to observe instead.
+    mirror.modalTimer = setInterval(() => {
+      let open = false;
+      try {
+        // Scoped to X's own dialog layer. document.querySelector for a missing
+        // attribute walks the WHOLE tree, and most of that tree is now the
+        // grid's own clones: 8,758 nodes at 46 posts, four times a second.
+        const scope = document.getElementById('layers') || document.body;
+        const d = scope.querySelector('[aria-modal="true"]');
+        open = !!(d && d.getBoundingClientRect().width > 100);
+      } catch (e) {}
+      if (open === mirror.modalOpen) return;
+      mirror.modalOpen = open;
+      mirror.root.style.visibility = open ? 'hidden' : '';
+    }, 250);
+    setStatus('GridX: mirroring ' + (SITE ? SITE.label : 'this feed')
+      + ' - scroll as usual and posts collect into the grid', 6000);
+  }
+
+  function stopMirror() {
+    if (!mirror) return;
+    if (mirror.obs) mirror.obs.disconnect();
+    if (mirror.sizes) mirror.sizes.disconnect();
+    if (mirror.modalTimer) clearInterval(mirror.modalTimer);
+    stopDwell();
+    if (catchupTimer) { clearTimeout(catchupTimer); catchupTimer = null; }
+    document.removeEventListener('scroll', mirror.onScroll, { capture: true });
+    window.removeEventListener('resize', mirror.onResize);
+    try { mirror.root.remove(); } catch (e) {}
+    document.documentElement.classList.remove('gridx-mirror-on');
+    mirror = null;
+  }
+
+  // How far down does the site's own pinned chrome reach? On x.com that is the
+  // sticky "For you / Following" tab strip: 54px that stays put no matter how
+  // far the reader scrolls. Only bars pinned to the top edge RIGHT NOW count -
+  // the composer is sticky too, but it scrolls away, and counting it as chrome
+  // is what left a permanent gap for the live feed to show through.
+  function pinnedBottom() {
+    let bottom = 0;
+    const consider = (el) => {
+      let cs;
+      try { cs = getComputedStyle(el); } catch (e) { return; }
+      if (cs.position !== 'sticky' && cs.position !== 'fixed') return;
+      let b;
+      try { b = el.getBoundingClientRect(); } catch (e) { return; }
+      if (b.height < 8 || b.height > 220) return;
+      if (b.top > 2 || b.bottom <= 0) return;
+      if (b.bottom > bottom) bottom = b.bottom;
+    };
+    // Walk the feed's own ancestor chain and look only at what sits BEFORE it.
+    // Scanning the whole column would mean a getBoundingClientRect per node on
+    // a page holding thousands of them; the tab strip is always inside an
+    // earlier sibling of one of these ancestors, a subtree of a few dozen.
+    let el = host;
+    let hops = 0;
+    while (el && el !== document.body && hops++ < 14) {
+      for (let sib = el.previousElementSibling; sib; sib = sib.previousElementSibling) {
+        consider(sib);
+        let inner = null;
+        try { inner = sib.querySelectorAll('div, header, nav, section'); } catch (e) {}
+        if (inner) for (let i = 0; i < inner.length && i < 200; i++) consider(inner[i]);
+      }
+      el = el.parentElement;
+    }
+    return Math.round(bottom);
+  }
+
+  // Cover the timeline column and the dead space to its right, and start below
+  // whatever the site keeps pinned at the top. Anchoring to <main> covered the
+  // whole window - X's own left nav and tab strip included - which made the
+  // page look broken rather than gridded.
+  function positionMirror() {
+    if (!mirror) return;
+    const col = document.querySelector('[data-testid="primaryColumn"]') || host;
+    let r;
+    try { r = col.getBoundingClientRect(); } catch (e) { return; }
+    // The feed's top edge is the right place to start ONLY while the composer
+    // above it is still on screen. It used to be measured once, at load, and
+    // never again - so the moment the reader scrolled, that same band filled
+    // with the site's real posts sliding past above a grid that never moved.
+    // A live strip of feed on top of a frozen grid is exactly the reported bug;
+    // clamping to the pinned chrome and re-measuring every tick is the fix.
+    const pinned = mirror.pinned || 0;
+    let top = pinned;
+    try {
+      const hr = host.getBoundingClientRect();
+      top = Math.max(pinned, Math.min(window.innerHeight - 80, Math.round(hr.top)));
+    } catch (e) {}
+    const left = Math.round(r.left);
+    // clientWidth, not innerWidth: innerWidth counts the scrollbar, so the
+    // overlay reached under it and painted its background over the track.
+    const vw = document.documentElement.clientWidth || window.innerWidth;
+    const width = Math.max(200, Math.round(vw - left - 8));
+    if (top === mirror.top && left === mirror.left && width === mirror.width) return;
+    mirror.top = top;
+    mirror.left = left;
+    mirror.width = width;
+    mirror.root.style.left = left + 'px';
+    mirror.root.style.width = width + 'px';
+    mirror.root.style.top = top + 'px';
+    mirror.root.style.height = Math.max(80, window.innerHeight - top) + 'px';
+    try {
+      mirror.root.style.background = getComputedStyle(document.body).backgroundColor || '#fff';
+    } catch (e) {}
+  }
+
+  function applyMirrorColumns() {
+    if (!mirror) return;
+    const requested = clampInt(settings.columnCount, 1, 8);
+    const min = (SITE && SITE.minColumn) || 200;
+    const w = mirror.root.getBoundingClientRect().width || window.innerWidth;
+    const gap = (settings.bleed ? 0 : 8) * densityScale();
+    const fits = Math.max(1, Math.floor((w + gap) / (min + gap)));
+    const cols = Math.max(1, Math.min(requested, fits));
+    mirror.cols = cols;
+    mirror.gap = gap;
+    // Below ~260px a post stops fitting: X's header collapses to a bare badge
+    // and timestamp with the display name gone, and the action row runs past
+    // the cell edge. Refusing the column was one answer, and it is why asking
+    // for six columns silently gave four. Scaling the whole post is a better
+    // one - it keeps every proportion, so a narrow column reads as a smaller
+    // post rather than a broken one. Safe here in a way it never was on X's
+    // own cells: these clones are in normal flow inside GridX's own grid.
+    const colW = (w - gap * (cols - 1)) / cols;
+    const prevW = mirror.colW; const prevZoom = mirror.zoom;
+    mirror.colW = colW;
+    const zoom = colW >= COMFORT_COLUMN ? 1 : Math.max(0.6, colW / COMFORT_COLUMN);
+    mirror.zoom = zoom;
+    mirror.inner.style.setProperty('--gx-cell-zoom', zoom.toFixed(3));
+    stats.columnCount = cols;
+    stats.effectiveColumns = cols;
+    mirror.inner.style.gridTemplateColumns = 'repeat(' + cols + ', minmax(0, 1fr))';
+    mirror.inner.style.columnGap = gap + 'px';
+    // Every cell just changed width (and possibly zoom), so every cached
+    // height is stale. Mark them, do not measure here: the read pass in
+    // packMirror does it in one go, after all the writes.
+    if (prevW !== colW || prevZoom !== zoom) {
+      for (const cell of mirror.inner.children) dirtyCells.add(cell);
+    }
+  }
+
+  // Walk the feed's own cells rather than every <article>: a quoted post is an
+  // <article> nested inside another, so querying articles directly captured the
+  // quote as a separate cell and mismatched permalinks. Taking the OUTERMOST
+  // article in each cell also lets ads through, which carry no /status/ link -
+  // keying only on permalink silently dropped half the feed (measured: 6 cells
+  // captured from 12 mounted articles).
+  function cellKey(cell, art) {
+    let url = '';
+    try { url = (SITE.permalink(art) || ''); } catch (e) {}
+    if (url) return url;
+    const t = (art.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+    return t ? 'txt:' + t : '';
+  }
+
+  // Heights are read ONCE per clone, in a pass that writes nothing, and after
+  // that they come from the ResizeObserver's own numbers. packMirror used to
+  // call getBoundingClientRect on every clone and write its placement right
+  // after each read, which forces a synchronous layout per cell: measured 4
+  // long tasks totalling 356ms for a single ten-tick scroll holding only 19
+  // clones, and the cost grows with everything the session collects.
+  const heights = new WeakMap();
+  const offsets = new WeakMap();
+  const rawHeights = new WeakMap();
+  let dirtyCells = new Set();
+  function measureNewCells() {
+    if (!mirror) return;
+    const todo = [];
+    for (const cell of mirror.inner.children) if (!heights.has(cell)) todo.push(cell);
+    for (const cell of dirtyCells) if (cell.isConnected) todo.push(cell);
+    dirtyCells.clear();
+    // getBoundingClientRect, not offsetHeight: a cell in a narrow column is
+    // ZOOMED, and offsetHeight reports the height before the zoom while the
+    // grid lays out the height after it. Measuring the wrong one leaves a
+    // proportional gap under every cell.
+    // Reads only - no style is written until the loop is over.
+    for (const cell of todo) heights.set(cell, cell.getBoundingClientRect().height || 0);
+  }
+
+  // A post is cloned the instant it mounts, and at that moment X has usually
+  // not filled in the avatar or the photo yet. Measured on the live account:
+  // 16 clones holding 8 <img> between them, from live posts carrying three to
+  // five EACH - which is why the grid showed grey avatar circles and empty
+  // white media boxes and never healed. While the source post is still
+  // mounted, take the picture again.
+  // X sizes its media boxes in JavaScript, in pixels, against its own 600px
+  // column and writes the numbers inline - a photo arrives in the clone with
+  // width:492px inside a 308px grid cell, and the cell's overflow:hidden then
+  // crops it. Inline styles beat any stylesheet, so trade the fixed box for
+  // its aspect ratio and let the column decide the width. Anything narrower
+  // than an avatar is left alone.
+  function fitMedia(clone) {
+    // The clone's images are second copies of pictures the page has already
+    // decoded once. Off-screen cells are skipped by content-visibility, so
+    // letting the browser defer both the fetch and the decode keeps a burst of
+    // new posts off the main thread during a scroll.
+    try {
+      const imgs = clone.querySelectorAll('img');
+      for (const im of imgs) { im.decoding = 'async'; im.loading = 'lazy'; }
+    } catch (e) {}
+    let boxes;
+    try { boxes = clone.querySelectorAll('[style*="width"]'); } catch (e) { return; }
+    for (const el of boxes) {
+      const w = parseFloat(el.style.width);
+      const h = parseFloat(el.style.height);
+      if (!(w > 120)) continue;
+      if (h > 0) {
+        el.style.aspectRatio = (w / h).toFixed(4);
+        el.style.height = 'auto';
+      }
+      el.style.width = '100%';
+      el.style.maxWidth = '100%';
+    }
+  }
+
+  // Two, not four: every re-take is a fresh subtree inserted and laid out, and
+  // the snapshot taken as X unmounts the post catches whatever these missed.
+  const REFRESH_LIMIT = 2;
+
+  // Is the copy behind the post it came from? Pictures were the obvious case,
+  // but TEXT arrives late too: measured on the live feed, a promoted post
+  // whose clone held 37 characters while the post itself had grown to 79 - the
+  // reader sees a cell with a line and a half and an action row, and nothing
+  // else. Image count alone cannot see that, since both had exactly one.
+  function staleClone(clone, art) {
+    let liveImgs = 0, mineImgs = 0, liveLen = 0, mineLen = 0;
+    try {
+      liveImgs = art.querySelectorAll('img').length;
+      mineImgs = clone.querySelectorAll('img').length;
+      liveLen = (art.textContent || '').length;
+      mineLen = (clone.textContent || '').length;
+    } catch (e) { return false; }
+    if (liveImgs > mineImgs) return true;
+    // A margin, so a relative timestamp ticking from 8h to 9h or a like count
+    // rolling over does not keep re-cloning a post that is already complete.
+    if (liveLen - mineLen > 12) return true;
+    // A post still spinning when it was copied stays spinning forever.
+    try {
+      if (clone.querySelector('[role="progressbar"]') &&
+          !art.querySelector('[role="progressbar"]')) return true;
+    } catch (e) {}
+    return false;
+  }
+
+  // Comparing a post with its copy means reading two whole subtrees as text,
+  // and X mutates constantly while scrolling, so the check is throttled per
+  // copy and stops once the post has had time to finish arriving.
+  //
+  // The window has to stay SHORT. A first attempt settled a copy after two
+  // quiet looks 600ms apart, and that broke the catching-up entirely on a fast
+  // scroll: X unmounts a post within a tick or two of it leaving the screen,
+  // so the second look never happened and 156 of 165 copies stayed
+  // picture-less. Age is the only safe stopping rule.
+  // A post finishes arriving on its own schedule, and once the reader stops
+  // scrolling X may make no further mutations at all - so the catch-up cannot
+  // depend on something else waking the loop. One timer, one pending at a
+  // time, and it stops as soon as every copy on screen has settled.
+  let catchupTimer = null;
+  function scheduleCatchup() {
+    if (catchupTimer || !mirror) return;
+    catchupTimer = setTimeout(() => {
+      catchupTimer = null;
+      if (mirror) syncMirror(false);
+    }, 400);
+  }
+
+  const SETTLE_AFTER_MS = 4000;
+  function maybeRefresh(clone, art, key) {
+    if (clone.__gxSettled) return false;
+    scheduleCatchup();
+    const now = Date.now();
+    if (clone.__gxNext && now < clone.__gxNext) return false;
+    clone.__gxNext = now + 250;
+    if (!clone.__gxBorn) clone.__gxBorn = now;
+    if (now - clone.__gxBorn > SETTLE_AFTER_MS) { clone.__gxSettled = true; return false; }
+    if (!staleClone(clone, art)) return false;
+    return refreshClone(clone, art, key);
+  }
+
+  // X hands us the node as it unmounts it. It is detached by then, but intact
+  // and complete, which is exactly the copy the grid wants.
+  function finalSnapshot(node) {
+    if (!mirror || !isEl(node)) return;
+    let art = null;
+    try { art = node.matches(ARTICLE) ? node : node.querySelector(ARTICLE); } catch (e) { return; }
+    if (!art) return;
+    const key = cellKey(node, art);
+    const clone = key ? mirror.seen.get(key) : null;
+    if (!clone || clone.__gxFinal) return;
+    clone.__gxFinal = true;
+    if (!staleClone(clone, art)) return;
+    refreshClone(clone, art, key, true);
+  }
+
+  function refreshClone(clone, art, key, force) {
+    const tries = clone.__gxRefresh || 0;
+    if (!force && tries >= REFRESH_LIMIT) return false;
+    if (!force && !staleClone(clone, art)) return false;
+    let next;
+    try { next = art.cloneNode(true); } catch (e) { return false; }
+    next.classList.add('gx-mirror-cell');
+    mirror.keyOf.set(next, key);
+    fitMedia(next);
+    watchDwell(next, key);
+    next.__gxRefresh = tries + 1;
+    next.__gxBorn = clone.__gxBorn || Date.now();
+    // On the element, so the cost of the catching-up is visible from outside:
+    // every re-take is a subtree inserted and laid out again.
+    next.dataset.gxTakes = String(tries + 2);
+    if (clone.dataset.gxUrl) next.dataset.gxUrl = clone.dataset.gxUrl;
+    // Keep the cell where it already sits; only its height is now unknown.
+    next.style.gridColumnStart = clone.style.gridColumnStart;
+    next.style.gridRowStart = clone.style.gridRowStart;
+    next.style.gridRowEnd = clone.style.gridRowEnd;
+    if (mirror.sizes) { try { mirror.sizes.unobserve(clone); } catch (e) {} }
+    try { clone.replaceWith(next); } catch (e) { return false; }
+    heights.delete(next);
+    mirror.seen.set(key, next);
+    if (mirror.sizes) { try { mirror.sizes.observe(next); } catch (e) {} }
+    return true;
+  }
+
+  // A clone's buttons are dead markup, but the post they were copied from is
+  // often still mounted a few hundred pixels underneath - X keeps a window of
+  // cells around the reader. When it is, a press on the copy is forwarded to
+  // the real button and the like, repost or bookmark actually happens; when it
+  // is not, the post opens instead so the reader can act on it there.
+  const ACTIONS = ['reply', 'retweet', 'unretweet', 'like', 'unlike',
+                   'bookmark', 'removeBookmark'];
+  function actionAt(el) {
+    let n = el;
+    for (let i = 0; i < 8 && n && n.getAttribute; i++) {
+      const t = n.getAttribute('data-testid');
+      if (t && ACTIONS.indexOf(t) >= 0) return t;
+      n = n.parentElement;
+    }
+    return '';
+  }
+
+  function liveArticleFor(key) {
+    if (!host || !key) return null;
+    for (const cell of host.children) {
+      if (!isEl(cell)) continue;
+      let art = null;
+      try { art = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE); } catch (e) { continue; }
+      if (!art) continue;
+      if (cellKey(cell, art) === key) return art;
+    }
+    return null;
+  }
+
+  // like <-> unlike and repost <-> unrepost are the same control in two
+  // states, and the copy can be showing the state from before the press.
+  const TWIN = { like: 'unlike', unlike: 'like', retweet: 'unretweet',
+                 unretweet: 'retweet', bookmark: 'removeBookmark',
+                 removeBookmark: 'bookmark' };
+  function forwardAction(clone, act) {
+    if (!mirror) return false;
+    const key = mirror.keyOf.get(clone);
+    const live = liveArticleFor(key);
+    if (!live) return false;
+    let btn = null;
+    try {
+      btn = live.querySelector('[data-testid="' + act + '"]') ||
+            (TWIN[act] ? live.querySelector('[data-testid="' + TWIN[act] + '"]') : null);
+    } catch (e) { return false; }
+    if (!btn) return false;
+    btn.click();
+    // The copy still shows the count and the state from before the press.
+    setTimeout(() => {
+      if (!mirror) return;
+      const again = liveArticleFor(key);
+      const cur = mirror.seen.get(key);
+      if (again && cur) { refreshClone(cur, again, key, true); scheduleMirror(true); }
+    }, 500);
+    return true;
+  }
+
+  function captureIntoMirror() {
+    if (!mirror) return 0;
+    // A detached node emits no mutations ever again, so if the site swapped its
+    // feed container the observer is dead and capture stops without a sound -
+    // which looks exactly like "it only ever collects the first few posts".
+    if (!host || !host.isConnected) {
+      const next = findHost();
+      if (!next) return 0;
+      host = next;
+      if (mirror.obs) {
+        mirror.obs.disconnect();
+        mirror.obs.observe(host, { childList: true, subtree: true });
+      }
+      mirror.pinned = pinnedBottom();
+      mirror.top = null;
+      positionMirror();
+      log('mirror re-attached to a rebuilt feed container');
+    }
+    let added = 0;
+    for (const cell of host.children) {
+      if (!isEl(cell)) continue;
+      let art = null;
+      try { art = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE); } catch (e) { continue; }
+      if (!art) continue;
+      const key = cellKey(cell, art);
+      if (!key) continue;
+      const have = mirror.seen.get(key);
+      if (have) { if (maybeRefresh(have, art, key)) added++; continue; }
+      let clone;
+      try { clone = art.cloneNode(true); } catch (e) { continue; }
+      if (key.indexOf('txt:') !== 0) clone.dataset.gxUrl = key;
+      clone.classList.add('gx-mirror-cell');
+      mirror.keyOf.set(clone, key);
+      fitMedia(clone);
+      noteSeen(art, key);
+      watchDwell(clone, key);
+      mirror.seen.set(key, clone);
+      mirror.order.push(key);
+      scheduleCatchup();
+      mirror.inner.appendChild(clone);
+      if (mirror.sizes) mirror.sizes.observe(clone);
+      added++;
+    }
+    // Bound the memory a long session can accumulate.
+    while (mirror.order.length > MIRROR_CAP) {
+      const drop = mirror.order.shift();
+      const el = mirror.seen.get(drop);
+      if (el) { try { el.remove(); } catch (e) {} }
+      mirror.seen.delete(drop);
+    }
+    return added;
+  }
+
+  function packMirror() {
+    if (!mirror) return 0;
+    const cols = mirror.cols || 1;
+    const gap = mirror.gap || 8;
+    const z = mirror.zoom || 1;
+    measureNewCells();
+    const colRows = new Array(cols).fill(0);
+    for (const cell of mirror.inner.children) {
+      const h = heights.get(cell) || 0;
+      if (!h) continue;
+      const span = Math.max(1, Math.ceil((h + gap) / ROW_UNIT));
+      // Where this cell lands, recorded rather than measured later. Reading
+      // clone.offsetTop to find the reader's place forced a layout of the
+      // whole collection on every scroll tick - 8,758 nodes at 46 posts, and
+      // it grows with everything collected since.
+      let c = 0;
+      for (let k = 1; k < cols; k++) if (colRows[k] < colRows[c]) c = k;
+      offsets.set(cell, colRows[c] * ROW_UNIT);
+      // Off-screen cells cost nothing if the browser is told how tall they
+      // are: content-visibility skips their layout and paint entirely, which
+      // is what keeps a collection of hundreds of posts scrolling. The size
+      // has to be given in the cell's OWN space, before its zoom.
+      const intrinsic = (h / z).toFixed(1) + 'px';
+      if (cell.__gxIntrinsic !== intrinsic) {
+        cell.__gxIntrinsic = intrinsic;
+        cell.style.containIntrinsicBlockSize = intrinsic;
+        cell.classList.add('gx-cv');
+      }
+      // (c is the shortest column, chosen above. Round robin gave every column
+      // the same NUMBER of posts however tall they were, so a column that drew
+      // three photo posts ran a screen and a half past one that drew three
+      // one-liners - those are the blank half-screens in the grid.)
+      setPlacement(cell, c + 1, colRows[c] + 1, span);
+      colRows[c] += span;
+    }
+    let tallest = 0;
+    for (const r of colRows) if (r > tallest) tallest = r;
+    return tallest * ROW_UNIT;
+  }
+
+  // Whatever element the page really scrolls, read the position from there.
+  function pageScrollTop() {
+    let best = 0;
+    const els = [document.documentElement, document.body, host];
+    for (const el of els) {
+      if (!el) continue;
+      try { if (el.scrollTop > best) best = el.scrollTop; } catch (e) {}
+    }
+    return best;
+  }
+
+  // Where in the feed is the reader? The site's own mounted cells answer that
+  // exactly, and matching the topmost one to its clone beats mapping scroll
+  // fractions: the site's scroll height is its VIRTUAL height and bears no
+  // fixed relation to the height of the grid collected so far, so the fraction
+  // drifted every time X extended its range. Returns -1 when nothing mounted
+  // has been captured yet.
+  function mirrorAnchorOffset() {
+    if (!mirror || !host) return -1;
+    const edge = (mirror.top || 0) + 4;
+    const rows = [];
+    for (const cell of host.children) {
+      if (!isEl(cell)) continue;
+      let b;
+      try { b = cell.getBoundingClientRect(); } catch (e) { continue; }
+      if (b.height < 4) continue;
+      let art = null;
+      try { art = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE); } catch (e) { continue; }
+      if (!art) continue;
+      const key = cellKey(cell, art);
+      const clone = key ? mirror.seen.get(key) : null;
+      if (!clone) continue;
+      rows.push({ top: b.top, height: b.height, clone: clone });
+    }
+    if (!rows.length) return -1;
+    rows.sort((a, b) => a.top - b.top);
+    let i = 0;
+    while (i < rows.length - 1 && rows[i].top + rows[i].height <= edge) i++;
+    const cur = rows[i];
+    const nxt = rows[i + 1] || null;
+    const cloneTop = (cl) => {
+      const o = offsets.get(cl);
+      return o === undefined ? cl.offsetTop : o;
+    };
+    const curTop = Math.max(0, cloneTop(cur.clone));
+    // Snapping straight to the anchor's own offset moved the grid ONLY when
+    // the anchor changed - one jump per post, roughly 120px at four columns,
+    // which is exactly the stutter that reads as "glitchy". Carrying the
+    // fraction of the anchor already scrolled past the top edge makes the
+    // grid travel with the wheel instead of behind it.
+    const frac = cur.height > 0
+      ? Math.min(1, Math.max(0, (edge - cur.top) / cur.height))
+      : 0;
+    const nextTop = nxt
+      ? Math.max(curTop, Math.max(0, cloneTop(nxt.clone)))
+      : curTop + (heights.get(cur.clone) || 0);
+    return curTop + (nextTop - curTop) * frac;
+  }
+
+  // Scrolling used to re-measure and re-place every clone on each tick - up to
+  // 400 getBoundingClientRect calls plus 1200 style writes per 80ms, which is
+  // exactly the "slow and glitchy" scroll. Placement only changes when cells
+  // are added or one of them resizes, so scrolling now moves the transform and
+  // nothing else.
+  // Where the time in a scroll actually goes. Guessing at this cost a round of
+  // "optimisations" that measured the same afterwards, so the loop reports its
+  // own numbers: turn on debug (gridx:update {debug:true}) and read
+  // document.documentElement.dataset.gridxProfile.
+  const prof = { position: 0, capture: 0, pack: 0, anchor: 0, total: 0, ticks: 0 };
+  let profAt = 0;
+  function publishProfile() {
+    const now = Date.now();
+    if (now - profAt < 1000) return;
+    profAt = now;
+    try {
+      document.documentElement.dataset.gridxProfile = JSON.stringify({
+        ticks: prof.ticks,
+        position: Math.round(prof.position),
+        capture: Math.round(prof.capture),
+        pack: Math.round(prof.pack),
+        anchor: Math.round(prof.anchor),
+        total: Math.round(prof.total),
+      });
+    } catch (e) {}
+  }
+
+  function syncMirror(repack) {
+    if (!mirror) return;
+    const t0 = performance.now();
+    positionMirror();
+    const t1 = performance.now();
+    const added = captureIntoMirror();
+    const t2 = performance.now();
+    if (repack || added) mirror.gridH = packMirror();
+    const t3 = performance.now();
+    const gridH = mirror.gridH || 0;
+    const viewH = mirror.root.clientHeight || window.innerHeight;
+    const gridRange = Math.max(0, gridH - viewH);
+    let y = mirrorAnchorOffset();
+    const t4 = performance.now();
+    if (y < 0) {
+      // Fall back to the page's own scroll fraction, via pageScrollRange()
+      // rather than documentElement: on live x.com <html> is exactly viewport
+      // height with zero range, so the old ratio was 0/1 forever and the
+      // transform never left translateY(0).
+      const range = Math.max(1, pageScrollRange());
+      y = Math.min(1, Math.max(0, pageScrollTop() / range)) * gridRange;
+    }
+    const offset = Math.round(Math.min(gridRange, Math.max(0, y)));
+    if (offset !== mirror.offset) {
+      mirror.offset = offset;
+      mirror.inner.style.transform = 'translateY(' + (-offset) + 'px)';
+    }
+    stats.postsRendered = mirror.seen.size;
+    updateStatsReadout();
+    if (settings.debug) {
+      prof.ticks++;
+      prof.position += t1 - t0;
+      prof.capture += t2 - t1;
+      prof.pack += t3 - t2;
+      prof.anchor += t4 - t3;
+      prof.total += performance.now() - t0;
+      publishProfile();
+    }
+  }
+
+  let mirrorTimer = null;
+  function scheduleMirror(repack) {
+    if (repack) mirrorRepack = true;
+    if (mirrorTimer || !mirror) return;
+    mirrorTimer = setTimeout(() => {
+      mirrorTimer = null;
+      const r = mirrorRepack; mirrorRepack = false;
+      syncMirror(r);
+    }, 60);
+  }
+  let mirrorRepack = false;
+
+  function standDownVirtualized() {
+    virtualizedGiveUp = true;
+    // Kill the retry loop first, or it keeps announcing "feed not found" over
+    // the top of the explanation - which is exactly what it did on x.com.
+    if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
+    hideFatal();
+    const label = SITE ? SITE.label : 'this site';
+    // A modal in the middle of the timeline is the wrong shape for "we are
+    // doing nothing here". Say it once, quietly, then remove every trace of
+    // GridX from the page: on a site we refuse to touch, leaving a filter bar
+    // and a dialog behind is worse than saying nothing at all.
+    setStatus('GridX: ' + label + ' renders its timeline virtualized, so the '
+      + 'grid would stall after a few posts. Leaving the site as it is.', 7000);
+    setTimeout(teardownOverlay, 7600);
+    log('stood down: feed is transform-virtualized');
+  }
+
+  function teardownOverlay() {
+    if (!root) return;
+    try { root.remove(); } catch (e) {}
+    root = null; fatalEl = null; filterInput = null; keymapEl = null;
+    statsEl = null; hintsEl = null;
+  }
+
+  function detectOutOfFlow() {
+    if (!host) return false;
+    const kids = Array.from(host.children).slice(0, 12)
+      .filter((k) => !(FILLER && k.matches && k.matches(FILLER)));
+    if (!kids.length) return false;
+    let abs = 0;
+    for (const k of kids) {
+      let pos = '';
+      try { pos = getComputedStyle(k).position; } catch (e) { continue; }
+      if (pos === 'absolute' || pos === 'fixed') abs++;
+    }
+    const outOfFlow = abs >= Math.max(2, kids.length * 0.5) && !unvirtBlocked;
+    document.documentElement.classList.toggle(CLASS_UNVIRT, outOfFlow);
+    if (outOfFlow) log('feed is virtualized/out-of-flow; cells put back in flow');
+    return outOfFlow;
+  }
+
+  // The status readout used to print the CONFIGURED column count, so it happily
+  // claimed "cols 8" while every post sat full width in a single column. Count
+  // the distinct left edges instead: that is what the reader can actually see.
+  function measureColumns() {
+    if (!host) return 0;
+    const xs = new Set();
+    let n = 0;
+    for (const cell of host.children) {
+      if (!isEl(cell) || n >= 12) break;
+      if (FILLER && cell.matches && cell.matches(FILLER)) continue;
+      try {
+        const r = cell.getBoundingClientRect();
+        if (r.width > 0) { xs.add(Math.round(r.left)); n++; }
+      } catch (e) {}
+    }
+    return xs.size;
   }
 
   function densityScale() {
@@ -319,19 +1451,160 @@
    * Per-article markings + filters (no re-parenting, no removal)
    * ------------------------------------------------------------------ */
   function markArticle(a) {
+    try {
+      if (!a.__gxLogged) {
+        a.__gxLogged = true;
+        const url = SITE ? SITE.permalink(a) : '';
+        if (url) { noteSeen(a, url); watchDwell(a, url); }
+      }
+    } catch (e) {}
     if (!a.dataset.gxUrl) {
-      const link = a.querySelector(STATUS_LINK);
-      if (link) a.dataset.gxUrl = link.href;
+      const url = SITE ? SITE.permalink(a) : '';
+      if (url) a.dataset.gxUrl = url;
     }
   }
 
   function articles() {
+    // In mirror mode the feed the reader sees is the mirror, not the site's
+    // own mounted window. Filtering the host instead hid posts nobody could
+    // see and left the grid untouched, and the post count reported the ~8
+    // cells X had mounted rather than the set collected.
+    if (mirror) return Array.from(mirror.inner.children);
     return host ? Array.from(host.querySelectorAll(ARTICLE)) : [];
   }
 
-  function isSponsor(a) { return !!a.querySelector(S.sponsored.join(', ')); }
-  function isRetweeted(a) { return /reposted/i.test(a.innerText || ''); }
-  function isVerified(a) { return !!a.querySelector(S.verified.join(', ')); }
+  /* ------------------------------------------------------------------ *
+   * Masonry packing.
+   *
+   * A plain CSS grid makes every row as tall as its tallest cell, so one post
+   * with a large image leaves a column-wide hole beside it - measured on live
+   * x.com, a 1130px post sat next to a 161px post and cost ~970px of dead
+   * space in a single row. The fix is the row-span trick: make the row track
+   * tiny and give each cell a span equal to its own height in track units, so
+   * cells pack against whatever is above them instead of against a shared row
+   * line. `align-items: start` is what makes this measurable - without it the
+   * grid would stretch each cell to its span and every height would read back
+   * as the track height rather than the content height.
+   * ------------------------------------------------------------------ */
+  const ROW_UNIT = 4; // px per implicit row track
+  let cellGap = 6;    // vertical breathing room, folded into each cell's span
+
+  // A narrower window may no longer carry the column count we picked, so the fit
+  // has to be recomputed before the cells are re-packed against it.
+  let resizeTimer = null;
+  function onViewportResize() {
+    if (resizeTimer || !active) return;
+    resizeTimer = setTimeout(() => {
+      resizeTimer = null;
+      if (!active || !host) return;
+      const cols = fittedColumns(clampInt(settings.columnCount, 1, 8));
+      if (cols !== stats.columnCount) {
+        stats.columnCount = cols;
+        setInline('gridTemplateColumns', 'repeat(' + cols + ', minmax(0, 1fr))');
+      }
+      scheduleMasonry();
+    }, 16);
+  }
+
+  // A latch guarded by requestAnimationFrame is a trap: rAF callbacks do not
+  // run while the document is hidden, so a pass scheduled in a background or
+  // minimised window never fires, the latch never reopens, and every later
+  // request returns early - the packing is dead for the rest of the page's
+  // life with no error anywhere. That is why cells kept their fallback span on
+  // www.reddit.com while old.reddit, which happened to schedule while visible,
+  // packed correctly. A timer fires either way, and layout reads are
+  // synchronous regardless of paint.
+  let masonryTimer = null;
+  function scheduleMasonry() {
+    if (masonryTimer || !active) return;
+    masonryTimer = setTimeout(() => { masonryTimer = null; layoutMasonry(); }, 16);
+  }
+
+  function layoutMasonry() {
+    if (!active || !host) return;
+    // Only meaningful while we own the layout as a grid.
+    try {
+      if (getComputedStyle(host).display !== 'grid') return;
+    } catch (e) { return; }
+    const gap = cellGap;
+    // Place every cell EXPLICITLY. Two approaches were measured on the live
+    // front page and only one is right for a feed.
+    //
+    // The grid's own auto-placement is "sparse": its cursor only moves forward,
+    // so with uneven spans an item lands at the first slot at-or-after the
+    // cursor that happens to fit. That put post 8 directly under post 1, ahead
+    // of 5, 6 and 7 - rows read 1 2 3 4, then 8 5 6 7, then 11 9 10 12.
+    //
+    // Classic masonry (always fill the shortest column) packs just as tightly
+    // but scrambles the order for the same reason: one column being a single
+    // 4px track taller is enough to send the next post somewhere unexpected.
+    // A feed is ordered by rank, so an order the reader cannot follow costs
+    // more than a ragged bottom edge does.
+    //
+    // Round-robin keeps both: post i goes to column i % cols and stacks flush
+    // under the previous post in that column. Rows read 1 2 3 4, then 5 6 7 8,
+    // with post 5 sitting 9px under post 1 - no row-height holes, order intact.
+    const cols = Math.max(1, (getComputedStyle(host).gridTemplateColumns || '')
+      .split(' ').filter(Boolean).length);
+    const colRows = new Array(cols).fill(0);
+    let idx = 0;
+    for (const cell of host.children) {
+      if (!isEl(cell)) continue;
+      if (FILLER && cell.matches && cell.matches(FILLER)) continue;
+      let h = 0;
+      try {
+        if (getComputedStyle(cell).display === 'none') continue;
+        h = cell.getBoundingClientRect().height;
+      } catch (e) { continue; }
+      if (!h) { clearPlacement(cell); continue; }
+      const span = Math.max(1, Math.ceil((h + gap) / ROW_UNIT));
+      const c = idx % cols;
+      idx++;
+      setPlacement(cell, c + 1, colRows[c] + 1, span);
+      colRows[c] += span;
+    }
+    stats.effectiveColumns = measureColumns();
+  }
+
+  // Writing an unchanged value still dirties layout, so every write is guarded.
+  function setPlacement(cell, col, row, span) {
+    const c = String(col), r = String(row), e = 'span ' + span;
+    if (cell.style.gridColumnStart !== c) cell.style.gridColumnStart = c;
+    if (cell.style.gridRowStart !== r) cell.style.gridRowStart = r;
+    if (cell.style.gridRowEnd !== e) cell.style.gridRowEnd = e;
+  }
+
+  function clearPlacement(cell) {
+    cell.style.removeProperty('grid-column-start');
+    cell.style.removeProperty('grid-row-start');
+    cell.style.removeProperty('grid-row-end');
+  }
+
+  function clearMasonry() {
+    if (!host) return;
+    for (const cell of host.children) if (isEl(cell)) clearPlacement(cell);
+  }
+
+  // Cells grow after the fact: images decode, embeds resize, "Show more"
+  // expands a post. Without watching for that the spans are computed against
+  // a height that is already stale and the packing drifts apart.
+  let sizeObserver = null;
+  function wireSizeObserver() {
+    if (typeof ResizeObserver === 'undefined') return;
+    if (sizeObserver) sizeObserver.disconnect();
+    sizeObserver = new ResizeObserver(() => scheduleMasonry());
+    for (const cell of host.children) {
+      if (isEl(cell)) { try { sizeObserver.observe(cell); } catch (e) {} }
+    }
+  }
+
+  function detachSizeObserver() {
+    if (sizeObserver) { sizeObserver.disconnect(); sizeObserver = null; }
+  }
+
+  function isSponsor(a) { try { return !!SITE.sponsored(a); } catch (e) { return false; } }
+  function isRetweeted(a) { try { return !!SITE.repost(a); } catch (e) { return false; } }
+  function isVerified(a) { try { return !!SITE.verified(a); } catch (e) { return false; } }
 
   function termHides(text, terms) {
     for (const raw of terms || []) {
@@ -343,24 +1616,86 @@
     return false;
   }
 
+  // Posts we have already tagged, and their cached lowercase text. Re-deriving
+  // either on every mutation is what made the grid crawl: the old version read
+  // innerText (a forced synchronous layout) for every post in the feed, on every
+  // mutation, even with no filter set. Measured at 27.7ms per call.
+  const seenPosts = new WeakSet();
+  const textCache = new WeakMap();
+  let hiddenNow = 0;
+  let lastFilterKey = null;
+
+  function filterKey() {
+    return JSON.stringify([
+      settings.filterKeywords, settings.filterHandles,
+      !!settings.hidePromoted, !!settings.hideRetweets, !!settings.hideVerified,
+    ]);
+  }
+  function filtersActive() {
+    return !!(
+      (settings.filterKeywords && settings.filterKeywords.length) ||
+      (settings.filterHandles && settings.filterHandles.length) ||
+      settings.hidePromoted || settings.hideRetweets || settings.hideVerified
+    );
+  }
+  // textContent, never innerText: innerText forces layout, textContent does not.
+  function textOf(a) {
+    let t = textCache.get(a);
+    if (t === undefined) { t = (a.textContent || '').toLowerCase(); textCache.set(a, t); }
+    return t;
+  }
+  function setHidden(a, hide) {
+    if (a.classList.contains('gx-hidden') !== hide) invalidateList();
+    a.classList.toggle('gx-hidden', hide);
+    // Hiding only the inner post would leave its wrapper occupying a cell.
+    const cell = cellOf(a);
+    if (cell !== a) cell.classList.toggle('gx-hidden', hide);
+  }
+
   function recomputeFilters() {
     if (!host) return;
+    const all = articles();               // one query, not two
+    if (!listCache || listCache.length !== all.length) invalidateList();
+    stats.postsRendered = all.length;
+
+    const key = filterKey();
+    const filtersChanged = key !== lastFilterKey;
+    lastFilterKey = key;
+
+    if (!filtersActive()) {
+      // Fast path, and the common case: nothing to hide. Tag only posts we have
+      // not seen, and sweep old hides away only if there are any.
+      for (const a of all) if (!seenPosts.has(a)) { seenPosts.add(a); markArticle(a); }
+      if (hiddenNow || filtersChanged) {
+        for (const a of all) setHidden(a, false);
+        hiddenNow = 0;
+      }
+      stats.postsFiltered = 0;
+      updateStatsReadout();
+      return;
+    }
+
     let hidden = 0;
-    for (const a of articles()) {
-      markArticle(a);
-      const text = (a.innerText || a.textContent || '').toLowerCase();
-      const kw = termHides(text, settings.filterKeywords);
-      const hf = termHides(text, settings.filterHandles);
-      const catHide =
+    for (const a of all) {
+      const isNew = !seenPosts.has(a);
+      if (isNew) { seenPosts.add(a); markArticle(a); }
+      // A post's verdict only changes when it is new or the filters changed.
+      if (!isNew && !filtersChanged) {
+        if (a.classList.contains('gx-hidden')) hidden++;
+        continue;
+      }
+      const text = textOf(a);
+      const hide =
+        termHides(text, settings.filterKeywords) ||
+        termHides(text, settings.filterHandles) ||
         (settings.hidePromoted && isSponsor(a)) ||
         (settings.hideRetweets && isRetweeted(a)) ||
         (settings.hideVerified && isVerified(a));
-      const hide = kw || hf || catHide;
-      a.classList.toggle('gx-hidden', hide);
+      setHidden(a, hide);
       if (hide) hidden++;
     }
+    hiddenNow = hidden;
     stats.postsFiltered = hidden;
-    stats.postsRendered = articles().length;
     updateStatsReadout();
   }
 
@@ -368,19 +1703,103 @@
    * Observer: react to X appending/removing articles without moving them.
    * We only re-tag + re-filter. X's own virtualization does the rest.
    * ------------------------------------------------------------------ */
+  // Only element additions/removals that actually involve a POST matter. Live
+  // feeds churn constantly - ticking timestamps, updating counters - and those
+  // arrive as text-node mutations. Reacting to them re-ran the whole filter pass
+  // several times a second for no benefit.
+  function touchesPost(nodes) {
+    for (const nd of nodes) {
+      if (nd.nodeType !== 1) continue;
+      if (nd.matches && nd.matches(ARTICLE)) return true;
+      if (nd.querySelector && nd.querySelector(ARTICLE)) return true;
+    }
+    return false;
+  }
+
+  let scanQueued = false;
   function wireObserver() {
     if (!host) return;
     if (observer) observer.disconnect();
-    observer = new MutationObserver(() => {
-      if (paused) return;
-      // The stream container can be replaced by X; re-resolve if it moved.
-      const now = findHost();
-      if (now && now !== host) { detachObserver(); host = now; savedStyles = null; ensureOverlay(); applyGrid(); wireObserver(); }
-      recomputeFilters();
+    observer = new MutationObserver((records) => {
+      if (paused || scanQueued) return;
+      let relevant = false;
+      for (const r of records) {
+        if (r.type !== 'childList') continue;
+        if (touchesPost(r.addedNodes) || touchesPost(r.removedNodes)) { relevant = true; break; }
+      }
+      if (!relevant) return;
+      // Coalesce a burst of mutations into a single pass. This used to latch on
+      // requestAnimationFrame, which never fires in a hidden tab - so a burst
+      // arriving while the window was in the background left scanQueued stuck
+      // true and every subsequent mutation was dropped for good.
+      scanQueued = true;
+      setTimeout(() => {
+        scanQueued = false;
+        if (!active || paused) return;
+        // Only re-resolve the container if the one we hold actually went away;
+        // findHost() walks the DOM and is far too costly to run per mutation.
+        if (!host || !host.isConnected) {
+          const now = findHost();
+          if (now && now !== host) {
+            detachObserver(); host = now; savedStyles = {};
+            ensureOverlay(); applyGrid(); wireObserver();
+          }
+        }
+        try { recomputeFilters(); } catch (e) { log('filter pass failed', e); }
+        wireSizeObserver();
+        scheduleMasonry();
+      }, 16);
     });
     observer.observe(host, { childList: true, subtree: true });
   }
   function detachObserver() { if (observer) { observer.disconnect(); observer = null; } }
+
+  /* ------------------------------------------------------------------ *
+   * Health watchdog.
+   *
+   * The MutationObserver is attached to the feed container. If the site
+   * REPLACES that container - which every SPA navigation on X does - the node
+   * we hold detaches, and a detached node emits no mutations ever again. The
+   * observer can therefore never notice its own death, and the grid silently
+   * stops working until a reload. This poll is the only thing that can catch
+   * that, so it stays cheap: an isConnected check and a computed-style read.
+   * ------------------------------------------------------------------ */
+  let healthTimer = null;
+  let lastHref = location.href;
+
+  function startHealth() {
+    stopHealth();
+    healthTimer = setInterval(() => {
+      if (!active || paused) return;
+
+      if (location.href !== lastHref) {
+        lastHref = location.href;
+        if (cursorArticle) { cursorArticle.classList.remove('gx-cursor'); cursorArticle = null; }
+        invalidateList();
+      }
+
+      // Feed container replaced or removed: re-resolve and re-apply.
+      if (!host || !host.isConnected) {
+        const next = findHost();
+        if (next) {
+          detachObserver();
+          host = next;
+          savedStyles = {};
+          applyGrid();
+          wireObserver();
+          recomputeFilters();
+          log('reattached to a new feed container');
+        }
+        return;
+      }
+
+      // Still our container, but the site re-rendered and clobbered the grid.
+      let disp = '';
+      try { disp = getComputedStyle(host).display; } catch (e) { return; }
+      if (disp !== 'grid') { applyGrid(); recomputeFilters(); log('grid reapplied'); }
+    }, 1500);
+  }
+  function stopHealth() { if (healthTimer) { clearInterval(healthTimer); healthTimer = null; } }
 
   /* ------------------------------------------------------------------ *
    * Click-to-open: user asked clicks on a post open the REAL post in a new
@@ -390,19 +1809,144 @@
   function onClick(e) {
     if (paused) return;
     if (e.defaultPrevented) return;
-    // Let X handle links, buttons, media controls, inputs natively.
+    const expander = e.target.closest && e.target.closest('.gx-expand');
+    if (expander && expander.parentElement) {
+      e.preventDefault();
+      e.stopPropagation();
+      onExpandClick(expander.parentElement);
+      return;
+    }
+    // A clone carries NONE of the site's handlers. Its role="link" wrappers,
+    // its like button, its tabindex containers and its images are inert
+    // markup, so treating them as "interactive, let the site deal with it"
+    // meant a click on almost any part of a mirrored post did nothing at all -
+    // and most of a post's surface is one of those. Only a real <a href> can
+    // still act for itself here; everything else opens the post.
+    const cell = e.target.closest && e.target.closest('.gx-mirror-cell');
+    if (cell) {
+      const act = actionAt(e.target);
+      if (act && forwardAction(cell, act)) {
+        noteAction(cell.dataset.gxUrl || '', act);
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
+      const own = cell.dataset.gxUrl || (SITE ? SITE.permalink(cell) : '');
+      // Even a real link goes to a new tab from inside the grid. Following one
+      // in place threw the collection away - the reader came back to a feed
+      // that had started over, because X rebuilds its timeline from the top
+      // and the mirror begins again with it.
+      const link = e.target.closest('a[href]');
+      if (link) {
+        const href = link.getAttribute('href') || '';
+        if (!href || href.charAt(0) === '#') return;
+        noteLink(own, link.href);
+        e.preventDefault();
+        e.stopPropagation();
+        openTab(link.href);
+        return;
+      }
+      if (!own) return;
+      noteOpen(own);
+      e.preventDefault();
+      e.stopPropagation();
+      openTab(own);
+      return;
+    }
+    // Let the site handle links, buttons, media controls, inputs natively.
     const interactive = e.target.closest(
       'a, [role="link"], [role="button"], button, [tabindex], input, textarea, video, audio, img, select'
     );
     if (interactive) return;
     const art = e.target.closest(ARTICLE);
     if (!art) return;
-    const url = art.dataset.gxUrl || (() => {
-      const l = art.querySelector(STATUS_LINK); return l ? l.href : '';
-    })();
+    const url = art.dataset.gxUrl || (SITE ? SITE.permalink(art) : '');
     if (!url) return;
+    noteOpen(url);
     e.preventDefault();
     openTab(url);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Expand affordance.
+   *
+   * Both sites clamp post text, and a narrow column clamps it harder, so posts
+   * read as truncated with no way to see the rest without leaving the grid.
+   * The button is injected on first hover of a cell rather than for every cell
+   * up front: a busy feed carries hundreds of cells and only the one under the
+   * pointer needs the control.
+   * ------------------------------------------------------------------ */
+  function onCellHover(e) {
+    if (!active || !host) return;
+    const t = e.target;
+    if (!t || !t.closest) return;
+    const cell = t.closest('.gx-stream > *');
+    if (!cell || cell.parentElement !== host) return;
+    if (FILLER && cell.matches && cell.matches(FILLER)) return;
+    if (cell.querySelector(':scope > .gx-expand')) return;
+    const btn = document.createElement('button');
+    btn.className = 'gx-expand';
+    btn.type = 'button';
+    btn.title = 'Show the full post (e)';
+    btn.setAttribute('aria-label', 'Show the full post');
+    btn.textContent = '⇲';
+    cell.appendChild(btn);
+  }
+
+  function onExpandClick(cell) {
+    const on = cell.classList.toggle('gx-expanded');
+    const post = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE);
+    if (post) post.classList.toggle('gx-expanded', on);
+    const btn = cell.querySelector(':scope > .gx-expand');
+    if (btn) btn.textContent = on ? '⇱' : '⇲';
+    scheduleMasonry();
+  }
+
+  /* ------------------------------------------------------------------ *
+   * Route awareness.
+   *
+   * These are single-page apps: opening a post swaps the timeline for one
+   * post without a page load, so the content script never re-runs and the grid
+   * kept applying to the permalink view. Watch the URL and stand down there.
+   * ------------------------------------------------------------------ */
+  function isFeedRoute() {
+    if (!SITE || !SITE.feedRoute) return true;
+    try { return !!SITE.feedRoute(location.pathname); } catch (e) { return true; }
+  }
+
+  // Tracks whether WE stood the grid down for the route, so returning to a feed
+  // only revives a grid the route turned off - never one the user switched off.
+  let standDown = false;
+  let routeHref = location.href;
+  let routeTimer = null;
+  function startRouteWatch() {
+    if (routeTimer) return;
+    routeTimer = setInterval(() => {
+      if (location.href === routeHref) return;
+      routeHref = location.href;
+      onRouteChange();
+    }, 400);
+  }
+
+  function stopRouteWatch() {
+    if (routeTimer) { clearInterval(routeTimer); routeTimer = null; }
+  }
+
+  function onRouteChange() {
+    if (!isFeedRoute()) {
+      if (active) {
+        standDown = true;
+        deactivate();
+        setStatus('GridX stands down on a single post', 4000);
+      }
+      return;
+    }
+    if (!active && standDown) {
+      // The feed is rebuilt from scratch on the way back; give it a beat.
+      setTimeout(() => {
+        if (!active && standDown && isFeedRoute()) { standDown = false; activate(); }
+      }, 500);
+    }
   }
 
   function openTab(url) {
@@ -427,23 +1971,53 @@
   let retryTimer = null;
   function activate() {
     if (active) return;
+    if (virtualizedGiveUp) return;
     ensureOverlay();
     hideFatal();
     host = findHost();
     if (!host) {
-      showFatal('GridX: no timeline container found yet. Retrying…');
+      // No dialog while the page is still building its feed. On a cold x.com
+      // load the timeline arrives a second or two after the content script,
+      // and this used to throw a red "feed not found" panel across the column
+      // on every single load, which then disappeared by itself. Say nothing
+      // until the retries are genuinely exhausted.
       scheduleRetry();
+      return;
+    }
+    // Decide before we restyle anything. A feed that places its own posts
+    // cannot be re-flowed in place, but it CAN be mirrored: leave it alone
+    // entirely and build the grid from clones as posts mount.
+    if (isTransformVirtualized(host)) {
+      active = true;
+      document.documentElement.classList.add(CLASS_ACTIVE);
+      document.documentElement.classList.add('gridx-site-' + SITE.id);
+      startMirror();
+      document.addEventListener('click', onClick, true);
+      document.addEventListener('keydown', onKeydown, true);
+      startStats();
+      log('mirror mode: feed is transform-virtualized');
       return;
     }
     active = true;
     document.documentElement.classList.add(CLASS_ACTIVE);
+    document.documentElement.classList.add('gridx-site-' + SITE.id);
     savedStyles = {};
+    tagWidenChain();
+    hostWasScroller = detectScroller(host);
+    document.documentElement.classList.toggle(CLASS_LOCK, hostWasScroller);
+    log('scroll owner:', hostWasScroller ? 'feed container' : 'document');
     applyGrid();
     recomputeFilters();
+    wireObserver();
+    wireSizeObserver();
+    scheduleMasonry();
+    window.addEventListener('resize', onViewportResize, { passive: true });
+    startHealth();
     document.addEventListener('click', onClick, true);
     document.addEventListener('keydown', onKeydown, true);
+    document.addEventListener('mouseover', onCellHover, true);
     startStats();
-    setStatus('GridX active');
+    setStatus('GridX active on ' + (SITE ? SITE.label : 'this site'));
     log('activated on', host);
   }
 
@@ -452,7 +2026,7 @@
   }
 
   function scheduleRetry() {
-    if (retryTimer) return;
+    if (retryTimer || virtualizedGiveUp) return;
     let tries = 0;
     retryTimer = setInterval(() => {
       tries++;
@@ -461,17 +2035,37 @@
     }, 1500);
   }
 
+  // A deliberate toggle from the popup or the keyboard clears the give-up flag:
+  // the user asking for the grid again is the one signal that should override
+  // our own decision to stay off.
+  function resetGiveUp() { virtualizedGiveUp = false; unvirtBlocked = false; }
+
   function deactivate() {
     if (!active) return;
     detachObserver();
+    stopHealth();
     stopStats();
+    stopPaginationWatch();
+    stopMirror();
+    detachSizeObserver();
+    window.removeEventListener('resize', onViewportResize);
+    clearMasonry();
+    untagWidenChain();
     restoreHost();
     document.removeEventListener('click', onClick, true);
     document.removeEventListener('keydown', onKeydown, true);
+    document.removeEventListener('mouseover', onCellHover, true);
+    for (const b of document.querySelectorAll('.gx-expand')) b.remove();
+    for (const c of document.querySelectorAll('.gx-expanded')) c.classList.remove('gx-expanded');
     document.documentElement.classList.remove(CLASS_ACTIVE, CLASS_SCAN);
+    for (const s of SITES) document.documentElement.classList.remove('gridx-site-' + s.id);
+    document.documentElement.classList.remove(CLASS_UNVIRT, CLASS_LOCK);
+    unvirtBlocked = false;
+    hostWasScroller = false;
     replantAll();
     active = false;
     cursorArticle = null;
+    invalidateList();
     if (retryTimer) { clearInterval(retryTimer); retryTimer = null; }
     log('deactivated');
   }
@@ -480,10 +2074,15 @@
   // classes/inline styles already restored). Nothing to move back.
   function replantAll() { /* no-op in re-flow architecture: X is untouched */ }
 
-  function showFatal(msg) {
+  function showFatal(msg, title) {
     if (!fatalEl) return;
     const ps = fatalEl.querySelectorAll('p');
+    // The heading is markup, so a caller that only replaced the body left the
+    // default "feed not found" standing above an unrelated message.
+    const h = fatalEl.querySelector('h1, h2, h3, strong');
+    if (h && title) h.textContent = title;
     if (msg && ps[1]) ps[1].textContent = msg;
+    if (ps[0]) ps[0].hidden = !!title;
     fatalEl.hidden = false;
   }
   function hideFatal() { if (fatalEl) fatalEl.hidden = true; }
@@ -493,10 +2092,13 @@
    * ------------------------------------------------------------------ */
   function startStats() {
     if (statTimer) clearInterval(statTimer);
+    let ticks = 0;
     statTimer = setInterval(() => {
       if (!paused) stats.gridActiveMs += 1000;
       updateStatsReadout();
-      persistCounters();
+      // Persisting counters every second is a storage write per second for no
+      // reason; every 15s is plenty for a stats readout.
+      if (++ticks % 15 === 0) persistCounters();
     }, 1000);
   }
   function stopStats() {
@@ -514,7 +2116,7 @@
     statsEl.textContent =
       'posts ' + stats.postsRendered +
       ' · hidden ' + stats.postsFiltered +
-      ' · cols ' + stats.columnCount +
+      ' · cols ' + (stats.effectiveColumns || stats.columnCount) +
       ' · up ' + fmtTime(stats.gridActiveMs) +
       (paused ? ' · paused' : '') +
       (settings.scanMode ? ' · scan' : '');
@@ -557,6 +2159,236 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * Reading log.
+   *
+   * What the reader actually looked at, on this machine only. Three signals,
+   * and the middle one is the one worth having:
+   *
+   *   seen   - the post reached the grid at all (the denominator)
+   *   dwell  - how long it was genuinely on screen: counted only while the
+   *            tab is visible and at least half the cell is in view
+   *   opened - the reader clicked it, liked it, reposted it or followed one of
+   *            its links, and how long they then spent on the post's own page
+   *
+   * Attention is the interesting measure, because everything gets seen and
+   * almost nothing gets read. Records are keyed by permalink and written to
+   * storage as DELTAS, so several open tabs cannot overwrite each other.
+   * ------------------------------------------------------------------ */
+  const LOG_CAP = 4000;                 // posts kept before the oldest go
+  const FLUSH_MS = 5000;
+  const DWELL_MIN_MS = 400;             // less than this is a post scrolling past
+  const DWELL_MAX_MS = 15 * 60 * 1000;  // a tab left open is not reading
+
+  let pending = new Map();   // id -> the delta this tab has not written yet
+  const meta = new Map();    // id -> what the post is (author, media, text)
+  const dwellStart = new Map();
+  let flushTimer = null;
+
+  const tracking = () => settings.trackReading !== false;
+
+  function postId(url) {
+    if (!url) return '';
+    const x = String(url).match(/\/status\/(\d+)/);
+    if (x) return 'x:' + x[1];
+    const r = String(url).match(/\/comments\/([a-z0-9]+)/i);
+    if (r) return 'r:' + r[1];
+    return '';
+  }
+
+  function delta(id) {
+    let d = pending.get(id);
+    if (!d) {
+      d = { seen: 0, dwellMs: 0, opens: 0, reads: 0, readMs: 0, acts: {}, hosts: {} };
+      pending.set(id, d);
+    }
+    return d;
+  }
+
+  // Read once, when the post is first collected. The click handler should not
+  // be walking a subtree to work out who wrote something.
+  function noteSeen(art, url) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id || meta.has(id)) return;
+    let author = '';
+    let media = 0;
+    let text = '';
+    try {
+      const link = art.querySelector('a[href^="/"]');
+      const m = link && (link.getAttribute('href') || '').match(/^\/([A-Za-z0-9_]+)/);
+      author = m ? m[1] : '';
+      media = art.querySelectorAll(
+        '[data-testid="tweetPhoto"], [data-testid="videoPlayer"], shreddit-aspect-ratio'
+      ).length;
+      // The post's OWN text, not the whole card. textContent runs adjacent
+      // nodes together, so the card gives you the author, the handle and the
+      // timestamp welded onto the first word ("Alice Chen@alice8hpost about
+      // grids"), and those fragments then turn up as your "subjects".
+      const body = art.querySelector('[data-testid="tweetText"], [slot="text-body"], .md, a.title');
+      text = ((body || art).textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    } catch (e) {}
+    meta.set(id, { a: author, m: media > 0 ? 1 : 0, w: text ? text.split(' ').length : 0, x: text });
+    delta(id).seen = 1;
+    scheduleFlush();
+  }
+
+  function noteOpen(url) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id) return;
+    delta(id).opens++;
+    scheduleFlush();
+  }
+
+  function noteAction(url, act) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id) return;
+    const d = delta(id);
+    d.acts[act] = (d.acts[act] || 0) + 1;
+    scheduleFlush();
+  }
+
+  function noteLink(url, href) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id) return;
+    let host = '';
+    try { host = new URL(href, location.origin).hostname.replace(/^www\./, ''); } catch (e) {}
+    if (!host || host === location.hostname) return;
+    const d = delta(id);
+    d.hosts[host] = (d.hosts[host] || 0) + 1;
+    scheduleFlush();
+  }
+
+  function dwellIn(id) {
+    if (!tracking() || !id || dwellStart.has(id)) return;
+    if (document.visibilityState !== 'visible') return;
+    dwellStart.set(id, Date.now());
+  }
+
+  function dwellOut(id) {
+    const started = dwellStart.get(id);
+    if (!started) return;
+    dwellStart.delete(id);
+    const ms = Date.now() - started;
+    if (ms < DWELL_MIN_MS || ms > DWELL_MAX_MS) return;
+    delta(id).dwellMs += ms;
+    scheduleFlush();
+  }
+
+  function dwellPauseAll() {
+    for (const id of Array.from(dwellStart.keys())) dwellOut(id);
+  }
+
+  // Cells arrive over the whole life of the grid, so the observer is built
+  // once and fed each new one.
+  let dwellObs = null;
+  function watchDwell(cell, url) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id) return;
+    cell.dataset.gxId = id;
+    if (!dwellObs) {
+      const opts = { threshold: [0, 0.5] };
+      if (mirror && mirror.root) opts.root = mirror.root;
+      dwellObs = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          const k = e.target.dataset.gxId;
+          if (!k) continue;
+          if (e.isIntersecting && e.intersectionRatio >= 0.5) dwellIn(k);
+          else dwellOut(k);
+        }
+      }, opts);
+    }
+    try { dwellObs.observe(cell); } catch (e) {}
+  }
+
+  function stopDwell() {
+    dwellPauseAll();
+    if (dwellObs) { dwellObs.disconnect(); dwellObs = null; }
+  }
+
+  function scheduleFlush() {
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => { flushTimer = null; flushActivity(); }, FLUSH_MS);
+  }
+
+  async function flushActivity() {
+    if (!pending.size) return;
+    const mine = pending;
+    pending = new Map();
+    try {
+      const store = await chrome.storage.local.get(ACTIVITY_KEY);
+      const data = store[ACTIVITY_KEY] || { v: 1, posts: {} };
+      if (!data.posts) data.posts = {};
+      const now = Date.now();
+      for (const [id, d] of mine) {
+        let rec = data.posts[id];
+        if (!rec) {
+          rec = { t: now, a: '', m: 0, w: 0, x: '', seen: 0, dwellMs: 0, opens: 0,
+                  reads: 0, readMs: 0, acts: {}, hosts: {} };
+          data.posts[id] = rec;
+        }
+        const info = meta.get(id);
+        if (info && !rec.a) { rec.a = info.a; rec.m = info.m; rec.w = info.w; rec.x = info.x; }
+        rec.seen += d.seen;
+        rec.dwellMs += d.dwellMs;
+        rec.opens += d.opens;
+        rec.reads += d.reads;
+        rec.readMs += d.readMs;
+        for (const k of Object.keys(d.acts)) rec.acts[k] = (rec.acts[k] || 0) + d.acts[k];
+        for (const k of Object.keys(d.hosts)) rec.hosts[k] = (rec.hosts[k] || 0) + d.hosts[k];
+        rec.last = now;
+      }
+      const ids = Object.keys(data.posts);
+      if (ids.length > LOG_CAP) {
+        ids.sort((a, b) => (data.posts[a].last || data.posts[a].t || 0) -
+                           (data.posts[b].last || data.posts[b].t || 0));
+        for (let i = 0; i < ids.length - LOG_CAP; i++) delete data.posts[ids[i]];
+      }
+      await chrome.storage.local.set({ [ACTIVITY_KEY]: data });
+    } catch (e) {
+      // Put the deltas back rather than lose the counting.
+      for (const [id, d] of mine) {
+        const cur = pending.get(id);
+        if (!cur) { pending.set(id, d); continue; }
+        cur.seen += d.seen; cur.dwellMs += d.dwellMs; cur.opens += d.opens;
+        cur.reads += d.reads; cur.readMs += d.readMs;
+      }
+    }
+  }
+
+  // Time spent on a post's own page. GridX does not grid a permalink view, but
+  // it is loaded there, and how long a post held the reader once they opened
+  // it is the strongest signal of the lot.
+  function startReadTimer() {
+    const id = postId(location.href);
+    if (!id || !tracking()) return;
+    let since = document.visibilityState === 'visible' ? Date.now() : 0;
+    const stop = () => {
+      if (!since) return;
+      const ms = Date.now() - since;
+      since = 0;
+      if (ms < DWELL_MIN_MS || ms > DWELL_MAX_MS) return;
+      const d = delta(id);
+      d.readMs += ms;
+      d.reads = 1;
+      flushActivity();
+    };
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') { if (!since) since = Date.now(); }
+      else stop();
+    });
+    window.addEventListener('pagehide', stop);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') { dwellPauseAll(); flushActivity(); }
+  });
+  window.addEventListener('pagehide', () => { dwellPauseAll(); flushActivity(); });
+
+  /* ------------------------------------------------------------------ *
    * Messaging (chrome.runtime + DOM custom events)
    * ------------------------------------------------------------------ */
   function applyMessage(detail) {
@@ -579,7 +2411,9 @@
   }
 
   function handleCommand(cmd) {
-    if (cmd === 'toggle-grid') { if (active) deactivate(); else activate(); }
+    // Asking for the grid by hand overrides our own decision to stay off a
+    // feed we judged un-griddable, so the user always gets the last word.
+    if (cmd === 'toggle-grid') { if (active) deactivate(); else { resetGiveUp(); hideFatal(); activate(); } }
     else if (cmd === 'toggle-pause') togglePause();
     else if (cmd === 'toggle-scan') toggleScan();
   }
@@ -588,6 +2422,7 @@
     try {
       chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
         if (!msg || typeof msg !== 'object') return;
+        if (msg.type === 'gridx:flushActivity') { flushActivity().then(() => sendResponse({ ok: true })); return true; }
         if (msg.type === 'gridx:update') { applyMessage(msg.settings || {}); sendResponse({ ok: true }); }
         else if (msg.type === 'gridx:command') { handleCommand(msg.payload); sendResponse({ ok: true }); }
         else if (msg.type === 'gridx:getState') { sendResponse(getState()); }
@@ -620,29 +2455,88 @@
    * ------------------------------------------------------------------ */
   const isEditable = (t) => t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
 
-  function list() {
-    return (host ? Array.from(host.querySelectorAll(ARTICLE)) : []).filter(a => !a.classList.contains('gx-hidden'));
+  // ...but e.target is RETARGETED at a shadow boundary. Type in Reddit's search
+  // box and the event reports <faceplate-search-input>, not the <input> inside
+  // it, so the check above saw a non-editable element and GridX swallowed the
+  // keystroke - which is why 's' (and f, p, j, k, o...) went missing mid-search.
+  // composedPath is the only view of the event that crosses shadow roots.
+  function editableLike(t) {
+    if (!t || t.nodeType !== 1) return false;
+    const tag = t.tagName;
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+    if (t.isContentEditable) return true;
+    const role = t.getAttribute && t.getAttribute('role');
+    return role === 'textbox' || role === 'searchbox' || role === 'combobox';
   }
-  function idx(a) { return list().indexOf(a); }
+
+  function deepActiveElement() {
+    let el = document.activeElement;
+    let hops = 0;
+    while (el && el.shadowRoot && el.shadowRoot.activeElement && hops++ < 10) {
+      el = el.shadowRoot.activeElement;
+    }
+    return el;
+  }
+
+  function inTypingContext(e) {
+    const path = (e.composedPath && e.composedPath()) || [];
+    for (const n of path) if (editableLike(n)) return true;
+    return editableLike(deepActiveElement()) || editableLike(e.target);
+  }
+
+  // Cached because every cursor move used to rebuild it: a full querySelectorAll
+  // plus a filter across the whole feed, per keypress. Invalidated whenever the
+  // post set or the hidden set changes.
+  let listCache = null;
+  function invalidateList() { listCache = null; }
+  function list() {
+    if (listCache) return listCache;
+    listCache = articles().filter((a) => !a.classList.contains('gx-hidden'));
+    return listCache;
+  }
+  function idx(a, l) { return (l || list()).indexOf(a); }
+  function fullyVisible(el) {
+    const r = el.getBoundingClientRect();
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    return r.top >= 0 && r.bottom <= vh;
+  }
   function focus(a) {
     if (!a) return;
     if (cursorArticle) cursorArticle.classList.remove('gx-cursor');
     cursorArticle = a; a.classList.add('gx-cursor');
-    a.scrollIntoView({ block: 'nearest' });
+    // A mirrored cell must never be scrolled to: the overlay does not scroll,
+    // so the browser would satisfy the request by scrolling the PAGE, which
+    // moves the site's feed under the grid and drags the grid along with it.
+    if (mirror && mirror.inner.contains(a)) return;
+    // scrollIntoView forces layout; skip it when the post is already on screen.
+    if (!fullyVisible(a)) a.scrollIntoView({ block: 'nearest' });
   }
   function move(delta) {
     const l = list(); if (!l.length) return;
-    const i = idx(cursorArticle);
+    const i = idx(cursorArticle, l);
     focus(l[i < 0 ? 0 : Math.max(0, Math.min(l.length - 1, i + delta))]);
   }
-  function scrollBy(f) { if (host) host.scrollTop += f * (host.clientHeight || 900); }
+  function scrollBy(f) {
+    if (host && hostWasScroller) { host.scrollTop += f * (host.clientHeight || 900); return; }
+    window.scrollBy(0, f * (window.innerHeight || 900));
+  }
   function openCursor(sameTab) {
     const a = cursorArticle;
     const url = a ? (a.dataset.gxUrl || '') : '';
     if (!url) { setStatus('no post under cursor'); return; }
     if (sameTab) window.location.href = url; else openTab(url);
   }
-  function toggleCursor() { if (cursorArticle) cursorArticle.classList.toggle('gx-expanded'); }
+  // Expand the post under the cursor. This used to toggle a class that no
+  // stylesheet responded to, so the key did nothing at all; the class now
+  // un-clamps the text and the cell grows to fit. Toggling the CELL (not the
+  // post) is what lets the box itself grow inside the grid.
+  function toggleCursor() {
+    if (!cursorArticle) { setStatus('no post under cursor'); return; }
+    const cell = cellOf(cursorArticle);
+    const on = cell.classList.toggle('gx-expanded');
+    cursorArticle.classList.toggle('gx-expanded', on);
+    scheduleMasonry();
+  }
   function toggleKeymap() { if (keymapEl) keymapEl.hidden = !keymapEl.hidden; }
   function clearCursorOrClose() {
     if (keymapEl && !keymapEl.hidden) { keymapEl.hidden = true; return; }
@@ -651,8 +2545,10 @@
 
   function onKeydown(e) {
     if (e.defaultPrevented) return;
+    // Never fight a browser or site chord: Ctrl/Cmd/Alt combinations are not ours.
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
     const t = e.target;
-    if (isEditable(t)) {
+    if (inTypingContext(e)) {
       if (t === filterInput && e.key === 'Escape') { e.preventDefault(); clearFilter('cleared filter'); }
       return;
     }
@@ -669,7 +2565,7 @@
       case 'Enter': openCursor(false); break;
       case 'o': openCursor(true); break;
       case 'Backspace': window.history.back(); break;
-      case 'x': toggleCursor(); break;
+      case 'x': case 'e': toggleCursor(); break;
       case 'f': if (filterInput) { filterInput.focus(); filterInput.select(); } break;
       case 's': toggleScan(); break;
       case 'p': togglePause(); break;
@@ -699,10 +2595,16 @@
    * Boot
    * ------------------------------------------------------------------ */
   async function init() {
+    // No adapter for this host: do nothing at all, leave the page untouched.
+    if (!SITE) return;
     await loadCounters();
     await loadSettings();
     registerMessaging();
-    activate();
+    startRouteWatch();
+    // A permalink view is not a feed, so the grid stays off - but this is
+    // exactly where "how long did that post hold you" is answered.
+    startReadTimer();
+    if (isFeedRoute()) activate();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);
   else init();

@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en" data-gridx-site="x">
+<head>
+<meta charset="utf-8">
+<title>X virtualized timeline fixture - GridX</title>
+<!--
+  Replicates how X ACTUALLY renders its timeline, which the flat fixture.html
+  does not:
+
+    <div aria-label="Timeline: Your Home Timeline" style="position:relative; min-height:NNNNpx">
+      <div data-testid="cellInnerDiv" style="position:absolute; width:100%; transform:translateY(0px)">
+      <div data-testid="cellInnerDiv" style="position:absolute; width:100%; transform:translateY(543px)">
+      ...
+
+  Every cell is absolutely positioned and placed with a transform, and the
+  container carries an explicit height so the scrollbar is the right size. This
+  matters enormously: absolutely positioned children are OUT OF FLOW, so
+  `display:grid` on the container has nothing to lay out and every post stacks
+  at its own transform offset. A grid applied naively here looks broken.
+
+  The virtualizer below also recycles cells on scroll the way X does.
+-->
+<style>
+  body { margin:0; font:14px/1.4 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         background:#fff; color:#0f1419; }
+  header[role="banner"] { position:sticky; top:0; height:53px; border-bottom:1px solid #eff3f4;
+                          display:flex; align-items:center; padding:0 16px; background:#fff; z-index:3; }
+  main[role="main"] { display:flex; }
+  [data-testid="primaryColumn"] { width:600px; border-left:1px solid #eff3f4; border-right:1px solid #eff3f4; }
+  [data-testid="sidebarColumn"] { width:350px; padding:12px; }
+  article[data-testid="tweet"] { border-bottom:1px solid #eff3f4; padding:12px 16px; box-sizing:border-box; }
+  .nm { font-weight:700; } .hd { color:#536471; }
+  .tw { margin:4px 0 8px; }
+  [role="group"] { display:flex; gap:48px; color:#536471; font-size:13px; }
+  .av { width:40px; height:40px; border-radius:50%; background:#cfd9de; float:left; margin-right:12px; }
+</style>
+</head>
+<body>
+<header role="banner"><strong>Home</strong></header>
+<main role="main">
+  <div data-testid="primaryColumn">
+    <div id="tl" aria-label="Timeline: Your Home Timeline" style="position:relative;"></div>
+  </div>
+  <div data-testid="sidebarColumn">sidebar</div>
+</main>
+<script>
+const Q = new URLSearchParams(location.search);
+const TOTAL = +(Q.get('posts') || 300);
+const NAMES = ['Alice Chen','Bob Rivera','Carol Kim','Dave Ortiz','Erin Wu','Frank Mills'];
+const HANDLES = ['alice','bob','carol','dave','erin','frank'];
+const BODIES = [
+  'short one',
+  'a medium length post that runs onto a second line when the column is narrow',
+  'a long post: ' + 'lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor '.repeat(3),
+];
+const tl = document.getElementById('tl');
+
+// Posts are NOT all the same height on X, and a grid that ignores that is what
+// leaves half-empty columns. Heights here range 150-520px.
+const AV = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='40' height='40'%3E%3Ccircle cx='20' cy='20' r='20' fill='%23657786'/%3E%3C/svg%3E";
+const PH = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='600' height='300'%3E%3Crect width='600' height='300' fill='%231d9bf0'/%3E%3C/svg%3E";
+const hasPhoto = (i) => i % 3 === 0;
+// Not only pictures arrive late. Measured on the live feed: a promoted post
+// whose clone held 37 characters while the post itself had grown to 79.
+const lateText = (i) => i % 5 === 0;
+const H = (i) => 150 + (i % 4) * 60 + (hasPhoto(i) ? 210 : 0);
+const OFF = [];
+let acc = 0;
+for (let i = 0; i < TOTAL; i++) { OFF.push(acc); acc += H(i); }
+
+function cell(i) {
+  const c = document.createElement('div');
+  c.setAttribute('data-testid', 'cellInnerDiv');
+  // This is the part that breaks a naive grid.
+  c.style.position = 'absolute';
+  c.style.width = '100%';
+  c.style.transform = 'translateY(' + OFF[i] + 'px)';
+  c.dataset.idx = String(i);
+  const h = HANDLES[i % HANDLES.length];
+  c.innerHTML =
+    '<article data-testid="tweet" style="min-height:' + (H(i) - 1) + 'px">' +
+      '<div class="av"></div>' +
+      '<div><span class="nm">' + NAMES[i % NAMES.length] + '</span> ' +
+        '<span class="hd">@' + h + ' &middot; ' + (i % 59 + 1) + 'm</span></div>' +
+      '<div class="tw" data-testid="tweetText">post number ' + i +
+        ' about ' + ['grids','latency','coffee','kernels','typography','banana'][i % 6] +
+        (lateText(i) ? '' : ' - ' + BODIES[i % BODIES.length]) + '</div>' +
+      '<a href="/' + h + '/status/' + (100000 + i) + '"><time>now</time></a>' +
+      '<div role="group">' +
+        '<div data-testid="reply" role="button" tabindex="0">12</div>' +
+        '<div data-testid="retweet" role="button" tabindex="0">34</div>' +
+        '<div data-testid="like" role="button" tabindex="0">56</div>' +
+        '<div data-testid="viewCount">1700</div>' +
+      '</div>' +
+    '</article>';
+  // X mounts the SHELL of a post first and fills the avatar and any photo in
+  // afterwards. Anything that clones a post the instant it appears therefore
+  // captures a picture-less copy - measured on the live site as 16 clones
+  // holding 8 <img> between them, from posts carrying three to five each.
+  setTimeout(() => {
+    if (!c.isConnected) return;
+    const av = c.querySelector('.av');
+    if (av && !av.firstChild) {
+      const im = document.createElement('img');
+      im.src = AV; im.width = 40; im.height = 40;
+      av.appendChild(im);
+    }
+    if (hasPhoto(i) && !c.querySelector('[data-testid="tweetPhoto"]')) {
+      // X does not let CSS size its media: it measures its own 600px column in
+      // JavaScript and writes the pixels inline, which is what overflowed a
+      // narrow grid cell once the pictures actually arrived.
+      const box = document.createElement('div');
+      box.setAttribute('data-testid', 'tweetPhoto');
+      box.style.width = '492px';
+      box.style.height = '246px';
+      const im = document.createElement('img');
+      im.src = PH; im.style.width = '100%'; im.style.height = '100%';
+      box.appendChild(im);
+      c.querySelector('article').appendChild(box);
+    }
+  }, 140);
+  // Text lands LATER than the pictures and on its own, so a copy that only
+  // watches for images cannot pick it up by accident.
+  setTimeout(() => {
+    if (!c.isConnected || !lateText(i)) return;
+    const t = c.querySelector('[data-testid="tweetText"]');
+    if (t && t.textContent.indexOf(' - ') === -1) {
+      t.textContent += ' - ' + BODIES[i % BODIES.length];
+    }
+  }, 520);
+  return c;
+}
+
+// The real buttons do something, so a copy's dead button has something to be
+// forwarded TO. window.__likes records every like the page actually received.
+window.__likes = [];
+document.addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('[data-testid="like"]');
+  if (!b) return;
+  const cell = b.closest('[data-testid="cellInnerDiv"]');
+  b.textContent = String((+b.textContent || 0) + 1);
+  window.__likes.push(cell ? cell.dataset.idx : '?');
+});
+
+// X keeps only a window of cells mounted and moves them as you scroll.
+let mounted = new Map();
+function indexAt(y) {
+  let lo = 0, hi = TOTAL - 1;
+  while (lo < hi) { const mid = (lo + hi) >> 1; if (OFF[mid] < y) lo = mid + 1; else hi = mid; }
+  return Math.max(0, lo - 1);
+}
+function virtualize() {
+  const top = window.scrollY;
+  const first = Math.max(0, indexAt(top) - 2);
+  const last = Math.min(TOTAL - 1, indexAt(top + innerHeight) + 2);
+  for (const [i, el] of mounted) {
+    if (i < first || i > last) { el.remove(); mounted.delete(i); }
+  }
+  for (let i = first; i <= last; i++) {
+    if (!mounted.has(i)) { const c = cell(i); tl.appendChild(c); mounted.set(i, c); }
+  }
+}
+tl.style.minHeight = acc + 'px';
+virtualize();
+addEventListener('scroll', virtualize, { passive: true });
+
+window.__mountedCount = () => mounted.size;
+</script>
+</body>
+</html>

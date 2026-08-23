@@ -111,3 +111,36 @@ table.keys td:first-child {
 
 .status { position: fixed; bottom: 16px; right: 16px; padding: 10px 16px; border-radius: 8px; background: #17bf63; color: #fff; font-weight: 600; opacity: 0; pointer-events: none; transition: opacity .2s; }
 .status.show { opacity: 1; }
+
+/* --- Reading log ------------------------------------------------------- */
+h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); font-weight: 600; }
+.statgrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px;
+  margin: 4px 0 8px;
+}
+.stat {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+.stat b {
+  display: block;
+  font-size: 18px;
+  /* Numbers in mono, words in the body face: a figure should read as a figure. */
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--fg);
+}
+.stat span { color: var(--muted); font-size: 11px; }
+table.lead { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.lead td { padding: 4px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+table.lead td.num {
+  text-align: right;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: var(--muted);
+}
+table.lead td.bar { width: 34%; }
+table.lead .fill { display: block; height: 6px; border-radius: 3px; background: var(--accent); opacity: 0.75; }
+table.lead td.snip { color: var(--muted); }

@@ -18,10 +18,34 @@
  * internals — that was the source of overlap.
  * ========================================================================== */
 
-/* --- Page-level: kill body scroll while the grid owns the tab. ----------- */
+/* --- Page-level: kill body scroll ONLY where the feed container is itself
+   the scroller (X). Reddit scrolls the document, so locking overflow there
+   freezes the page and strands its infinite-scroll sentinel. --------------- */
 html.gridx-active,
 html.gridx-active body {
   scroll-behavior: auto !important;
+}
+/* Never a horizontal scrollbar: once the document owns the vertical scroll, its
+   scrollbar can push a 100%-width child a few px past the viewport. The ROOT is
+   the only place this may be said. Naming <body> too gave x.com TWO vertical
+   scrollbars, and the mechanism is a rule in the CSS spec rather than anything
+   to do with X: an overflow-x that is not `visible` forces the computed
+   overflow-y to `auto`, so clipping the body horizontally quietly turned it
+   into its own scroll container. Measured at a 1280px viewport - with <body>
+   in this rule, html clientWidth 1265 / body clientWidth 1250 (two bars) and
+   the html scroll range collapsed to 0, leaving x.com's own permanently
+   visible `overflow-y: scroll` track dead beside a live one; with the root
+   alone, both are 1265, one bar, and the html range is the real 10409. It also
+   put GridX's scroll handling on a false footing, because the page then really
+   did scroll <body> - a fact GridX had measured, recorded and coded against
+   without noticing it had caused it. */
+html.gridx-active {
+  overflow-x: hidden !important;
+}
+/* Only when the feed container is genuinely the scroller. x.com scrolls the
+   DOCUMENT, so applying this there froze the whole page. */
+html.gridx-active.gx-lock-scroll,
+html.gridx-active.gx-lock-scroll body {
   overflow: hidden !important;
 }
 
@@ -36,6 +60,20 @@ html.gridx-active [data-testid="primaryColumn"] {
   max-width: none !important;
   margin: 0 auto !important;
 }
+/* Neither of the rules above reaches the cap that actually binds. Measured on
+   live x.com at a 1280px viewport: an intermediate wrapper between the feed
+   and primaryColumn carries max-width:600px, and MAIN is a column flex box
+   that CENTRES its child rather than stretching it. Result was three 196px
+   columns - text wrapping after three words, avatars collapsed to grey
+   squares, metric counts printed on top of each other. JS tags this one
+   ancestor chain so the caps are lifted only in the feed's own path; with them
+   gone the same viewport gives three 412px columns and all three symptoms
+   disappear at once. */
+html.gridx-active [data-gx-widen] {
+  max-width: none !important;
+  width: 100% !important;
+}
+html.gridx-active main { align-items: stretch !important; }
 
 /* --- Density/font/brand vars cascading from <html> into the feed. ------- */
 html.gridx-active {
@@ -66,6 +104,67 @@ html.gridx-active {
   font-size: calc(14px * var(--gx-font-scale) * (1 - 0.08 * var(--gx-density)));
 }
 
+/* `content-visibility: auto` used to live here as a scroll optimisation. It had
+   to go: it applies paint containment, which CLIPS anything overflowing the
+   cell - that is what cut post titles off mid-word - and it substitutes
+   contain-intrinsic-size for the real height of every off-screen cell, so every
+   cell measured exactly 220px and the height-based packing below had nothing
+   true to measure. Measured on live old.reddit: all cells reported h=220 with
+   content-visibility on, and 245/525/166/264/361/335/460 with it off. A grid
+   that packs by height cannot be built on heights the browser is faking. */
+
+/* The packing below sets grid-auto-rows to a 4px track so a cell can span
+   exactly its own height. That makes an UNMEASURED cell dangerous: with no
+   span it occupies a single 4px row, and every unmeasured cell lands on the
+   same rows. Measured on live old.reddit: with the spans cleared, all 25 posts
+   stacked on top of one another in a 100px band. This default reserves a
+   post-sized block until the real span arrives, so the worst a missed pass can
+   do is leave a gap for one frame instead of shredding the feed. */
+html.gridx-active .gx-stream > * { grid-row-end: span 55; }
+
+/* Long unbroken words (URLs, handles, "hermes's") must wrap rather than spill
+   past the cell edge, and the metadata Reddit marks `nowrap` - flair, domain,
+   subreddit - must not drag a 341px line through a 151px column. */
+html.gridx-active .gx-stream > * {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+html.gridx-active .gx-stream > * [style*="nowrap"],
+html.gridx-active .gx-stream .flairrichtext,
+html.gridx-active .gx-stream .domain,
+html.gridx-active .gx-stream .subreddit,
+html.gridx-active .gx-stream .tagline > * {
+  max-width: 100% !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+/* ===========================================================================
+ * Virtualized feeds (X's timeline).
+ *
+ * X mounts a window of cells, each `position:absolute` with a translateY, and
+ * gives the container an explicit height so the scrollbar is right. Out-of-flow
+ * children are invisible to grid layout, so without this the grid applies and
+ * changes nothing. Only added when out-of-flow cells are actually detected, so
+ * a normal flow feed is never touched.
+ * ========================================================================== */
+html.gridx-active.gx-unvirtualized .gx-stream > * {
+  position: relative !important;
+  transform: none !important;
+  top: auto !important;
+  left: auto !important;
+  right: auto !important;
+  bottom: auto !important;
+  width: auto !important;
+  max-width: 100% !important;
+}
+/* The container's height was sized for the virtual list, not for what is
+   actually laid out; leaving it would strand the page in empty scroll space. */
+html.gridx-active.gx-unvirtualized .gx-stream {
+  min-height: 0 !important;
+  height: auto !important;
+}
+
 /* --- Filter / cursor / paused moon --------------------------------------- */
 .gx-hidden { display: none !important; }
 .gx-cursor {
@@ -80,13 +179,223 @@ html.gridx-active.gx-hide-avatar .gx-stream [data-testid="UserAvatar-Container"]
 html.gridx-active.gx-hide-avatar .gx-stream [data-testid="Tweet-User-Avatar"],
 html.gridx-scan .gx-stream [data-testid="UserAvatar-Container"] { display: none !important; }
 
+/* card.wrapper is X's link preview. It was not in this list, and in the grid it
+   is the single biggest waste of a cell: a mirrored clone cannot load the
+   card's lazy image at all, so "no media" still left a 250px empty box with a
+   domain caption under it. Measured on the live feed: 3 of 11 cells. */
 html.gridx-active.gx-hide-media .gx-stream [data-testid="tweetPhoto"],
 html.gridx-active.gx-hide-media .gx-stream [data-testid="videoPlayer"],
+html.gridx-active.gx-hide-media .gx-stream [data-testid="card.wrapper"],
 html.gridx-scan .gx-stream [data-testid="tweetPhoto"],
+html.gridx-scan .gx-stream [data-testid="card.wrapper"],
 html.gridx-scan .gx-stream [data-testid="videoPlayer"] { display: none !important; }
 
 html.gridx-active.gx-hide-metrics .gx-stream [role="group"],
 html.gridx-scan .gx-stream [role="group"] { display: none !important; }
+
+/* ===========================================================================
+ * Reddit (shreddit + old.reddit). Same model as X: we only restyle Reddit's
+ * own feed container and never move a node.
+ * ========================================================================== */
+
+/* Separators between entries would each occupy their own grid cell. new.reddit
+   uses <hr>; old.reddit follows every post with an empty float-clearing div.
+   Measured on live old.reddit.com: 25 posts and 25 .clearleft spacers, so a
+   third of the grid was blank and the reading order zigzagged across it. */
+.gx-stream > hr,
+.gx-stream > .clearleft { display: none !important; }
+
+/* Reddit's post wrapper and the custom element must not force a min width
+   wider than the column, or the grid overflows horizontally. */
+.gx-stream > article,
+.gx-stream shreddit-post,
+.gx-stream shreddit-ad-post,
+.gx-stream .thing.link {
+  min-width: 0 !important;
+  max-width: 100% !important;
+  box-sizing: border-box;
+}
+
+/* Reddit caps the feed column and reserves rails on both sides; reclaim the
+   width. Hiding a rail is not enough on its own: its grid TRACK survives, so
+   the feed reflows into the leftover narrow column (measured: 68px columns).
+   The container must be told to span every track. */
+html.gridx-active #subgrid-container,
+html.gridx-active .subgrid-container,
+html.gridx-active .main-container,
+html.gridx-active #main-content,
+html.gridx-active main {
+  /* grid-area MUST come first: it is a shorthand for grid-column, so the old
+     order silently reset the span below it to auto and the feed never spanned
+     anything. Measured on live www.reddit.com: computed grid-column was "auto"
+     despite the 1 / -1 declaration. */
+  grid-area: auto !important;
+  grid-column: 1 / -1 !important;
+  max-width: none !important;
+  width: 100% !important;
+}
+html.gridx-active #right-sidebar-container,
+html.gridx-active aside[aria-label="Recent Posts"],
+html.gridx-active reddit-sidebar-nav,
+html.gridx-active #left-sidebar-container,
+html.gridx-active flex-left-nav-container,
+html.gridx-active #left-sidebar { display: none !important; }
+/* With the rails gone the parent grid should not keep reserving their tracks.
+   .main-container needs this as much as .grid-container does: measured on live
+   www.reddit.com it kept "756px 316px", pinning the feed to 756px of a 1280px
+   viewport while the 316px rail track sat empty beside it. */
+html.gridx-active .grid-container,
+html.gridx-active .main-container { grid-template-columns: minmax(0, 1fr) !important; }
+
+/* Feature toggles mapped onto Reddit's markup. */
+html.gridx-active.gx-hide-avatar .gx-stream shreddit-post img[src*="avatar"],
+html.gridx-active.gx-hide-avatar .gx-stream faceplate-img[loading],
+html.gridx-scan .gx-stream shreddit-post img[src*="avatar"] { display: none !important; }
+
+html.gridx-active.gx-hide-media .gx-stream shreddit-aspect-ratio,
+html.gridx-active.gx-hide-media .gx-stream shreddit-media-lightbox-listener,
+html.gridx-active.gx-hide-media .gx-stream [slot="thumbnail"],
+html.gridx-active.gx-hide-media .gx-stream .thing.link .thumbnail,
+html.gridx-scan .gx-stream shreddit-aspect-ratio,
+html.gridx-scan .gx-stream [slot="thumbnail"] { display: none !important; }
+
+html.gridx-active.gx-hide-metrics .gx-stream shreddit-post-flair,
+html.gridx-active.gx-hide-metrics .gx-stream [slot="post-media-container"] ~ div,
+html.gridx-active.gx-hide-metrics .gx-stream .thing.link .buttons,
+html.gridx-scan .gx-stream .thing.link .buttons { display: none !important; }
+
+/* --- Expand: show the text a narrow column hides. ------------------------
+   Both sites clamp post text, and a narrow column clamps it harder, so posts
+   read as truncated with no way to reach the rest without leaving the grid.
+   `gx-expanded` used to be toggled by the keyboard onto a class no stylesheet
+   answered, so the key silently did nothing. It now lifts every clamp we can
+   reach and drops any scale-down, and the cell re-packs around its new height. */
+html.gridx-active .gx-expanded,
+html.gridx-active .gx-expanded [class*="line-clamp"],
+html.gridx-active .gx-expanded [style*="line-clamp"],
+html.gridx-active .gx-expanded .md,
+html.gridx-active .gx-expanded [data-testid="tweetText"],
+html.gridx-active .gx-expanded p,
+html.gridx-active .gx-expanded div {
+  -webkit-line-clamp: unset !important;
+  line-clamp: unset !important;
+  max-height: none !important;
+  overflow: visible !important;
+  text-overflow: clip !important;
+}
+/* Expanded posts are read, not scanned: give them full size even in a narrow
+   column, and lift them above their neighbours while they are open. */
+/* z-index only: forcing `position` here would yank a single X cell out of the
+   virtualizer's absolute placement and make it jump across the feed. */
+html.gridx-active .gx-stream > .gx-expanded { z-index: 4; }
+html.gridx-active .gx-stream > .gx-expanded shreddit-post,
+html.gridx-active .gx-stream > .gx-expanded shreddit-ad-post,
+html.gridx-active .gx-stream > .gx-expanded .thing.link { zoom: 1 !important; }
+/* Media stays hidden by the toggle, but expanding should never hide the text. */
+html.gridx-active .gx-expanded [data-testid="tweetText"] { display: block !important; }
+
+/* The control itself: only rendered into the cell under the pointer. */
+.gx-expand {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  z-index: 6;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  line-height: 18px;
+  font-size: 12px;
+  text-align: center;
+  cursor: pointer;
+  opacity: 0;
+  color: var(--gx-fg);
+  background: var(--gx-bg);
+  border: 1px solid var(--gx-border);
+  border-radius: 6px;
+  transition: none;
+}
+html.gridx-active .gx-stream > *:hover > .gx-expand,
+.gx-expand:focus-visible { opacity: 1; }
+/* The button needs a positioned cell to sit in, but this must NEVER be applied
+   blindly: on x.com the cells are absolutely positioned by the site's
+   virtualizer, and forcing them to `relative` is precisely the unvirtualize
+   that stops X mounting posts. Only take cells that are already in flow. */
+html.gridx-active.gridx-site-reddit .gx-stream > *,
+html.gridx-active.gx-unvirtualized .gx-stream > * { position: relative; }
+/* A mirrored cell is a CLONE in GridX's own grid, not one of the site's
+   virtualized cells, so the warning above does not reach it: nothing the
+   site's loader measures is affected by positioning a copy. */
+html.gridx-active #gridx-mirror-inner > * { position: relative; }
+
+/* --- Narrow columns: keep the action row inside the cell. ----------------
+   At six columns on a 1280px viewport a cell is ~197px and the vote / comment
+   / repost / share row no longer fits, so it rendered half-drawn against the
+   cell edge. On X that row is light DOM and can simply be told to shrink. On
+   Reddit it is built inside a shadow root that no content stylesheet can
+   select into, so the only lever that crosses the boundary is scaling the post
+   itself. Container queries make it self-tuning: the scale keys off the cell's
+   own width, so it engages exactly when the column is too narrow and never
+   when it is not, at any column count or window size. */
+/* Same caution: inline-size containment makes an element's inline size
+   independent of its contents, which on an auto-width absolutely positioned
+   cell collapses it. Reddit's cells are in normal flow, so scope it there. */
+html.gridx-active.gridx-site-reddit .gx-stream > * { container-type: inline-size; }
+
+/* X: light DOM, so shrink rather than scale - no text-size cost. */
+html.gridx-active .gx-stream [role="group"],
+html.gridx-active .gx-stream [role="group"] > * { min-width: 0 !important; }
+html.gridx-active .gx-stream [role="group"] { flex-wrap: wrap !important; }
+
+@container (max-width: 340px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.92; }
+}
+@container (max-width: 290px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.84; }
+}
+@container (max-width: 230px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.74; }
+  html.gridx-active .gx-stream .thing.link { zoom: 0.82; }
+}
+/* Seven and eight columns land here, and the vote/comment/share row is built
+   in a shadow root that no stylesheet can reach into - scaling the host is the
+   only lever that crosses the boundary, so the steps have to keep going. */
+@container (max-width: 190px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.66; }
+  html.gridx-active .gx-stream .thing.link { zoom: 0.74; }
+}
+@container (max-width: 155px) {
+  html.gridx-active .gx-stream shreddit-post,
+  html.gridx-active .gx-stream shreddit-ad-post { zoom: 0.58; }
+  html.gridx-active .gx-stream .thing.link { zoom: 0.66; }
+}
+
+/* Reddit pads each post 16px on both sides. Inside a grid cell that is 32px of
+   a column spent on whitespace the grid gap already provides, and it is what
+   pushed the action row past the cell edge: measured on live www.reddit.com at
+   four columns, the Share button's right edge sat 6px beyond the post's. The
+   row cannot be fixed from the inside - Reddit builds it in a shadow root that
+   no content stylesheet can select into - so the only lever is to stop wasting
+   the width in the first place. */
+html.gridx-active .gx-stream shreddit-post,
+html.gridx-active .gx-stream shreddit-ad-post { padding-inline: 6px !important; }
+
+/* old.reddit lays posts out in a table-ish flow; neutralize the float. */
+.gx-stream .thing.link { float: none !important; display: block !important; }
+
+/* old.reddit reserves a fixed right rail and gives .content a matching right
+   margin, which cost 325px of a 1280px viewport. Drop the rail the same way we
+   drop X's and new.reddit's, and reclaim the margin it reserved. */
+html.gridx-active.gridx-site-reddit .side { display: none !important; }
+html.gridx-active.gridx-site-reddit .content[role="main"],
+html.gridx-active.gridx-site-reddit body > .content {
+  margin-right: 0 !important;
+  width: auto !important;
+}
+
 
 /* --- Kill X animation on the grid path (fast scanning). ------------------ */
 html.gridx-active .gx-stream,
@@ -126,13 +435,16 @@ html.gridx-active .gx-stream *,
   }
 }
 
-/* --- Filter bar: fixed chip, top-center, draggable-ish --------------------------------- */
+/* --- Filter bar: fixed chip, bottom-left. -------------------------------
+   It used to sit top-centre, which is exactly where every supported site puts
+   its own controls: it covered X's For you / Following tab strip, new Reddit's
+   search box and old Reddit's subreddit nav, permanently. Bottom-left clears
+   all three and stays clear of the bottom-centre status bar. */
 #gridx-filterbar {
   pointer-events: auto;
   position: fixed;
-  top: 10px;
-  left: 50%;
-  transform: translateX(-50%);
+  bottom: 8px;
+  left: 12px;
   z-index: 10;
   display: flex;
   align-items: center;
@@ -239,3 +551,66 @@ html.gridx-active .gx-stream *,
   border-radius: 999px;
   cursor: pointer;
 }
+
+/* ===========================================================================
+ * Mirror mode (feeds that place their own posts, e.g. x.com).
+ *
+ * The overlay must never take pointer events: the wheel has to reach the real
+ * timeline underneath so the site's virtualizer keeps mounting posts on the
+ * reader's own scrolling. Individual cells opt back in so a post can be
+ * clicked; a cell is not a scroll container, so the wheel still passes through.
+ * ========================================================================== */
+#gridx-mirror {
+  position: fixed;
+  z-index: 9998;
+  pointer-events: none;
+  overflow: hidden;
+  /* No `contain: strict` here. It buys paint isolation but turns the overlay
+     into a containment context that can swallow wheel events instead of
+     letting them chain to the page - and the page scrolling is the ONLY thing
+     that makes the site mount more posts to mirror. */
+  overscroll-behavior: auto;
+}
+#gridx-mirror-inner {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  display: grid;
+  align-items: start;
+  align-content: start;
+  row-gap: 0;
+  grid-auto-rows: 4px;
+  will-change: transform;
+}
+/* A narrow column scales the whole post rather than breaking it up. The
+   factor is computed in JS from the real column width (applyMirrorColumns),
+   because GridX knows that width exactly and a container query would only
+   approximate it in steps. `zoom`, not `transform: scale()`: zoom changes the
+   space the cell actually takes, which is what the grid packs against. */
+#gridx-mirror-inner > * {
+  zoom: var(--gx-cell-zoom, 1);
+}
+/* A cell whose height GridX has actually measured carries that height as its
+   intrinsic size (written inline by packMirror), so the browser can skip the
+   layout and paint of everything off screen and still size the scroll
+   correctly. Without it the cost of a scroll grows with every post the session
+   has ever collected. */
+#gridx-mirror-inner > .gx-cv {
+  content-visibility: auto;
+}
+#gridx-mirror-inner > * {
+  pointer-events: auto;
+  overflow: hidden;
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.22);
+  grid-row-end: span 55;
+}
+/* The mirrored copy is a snapshot, so anything that would invite an action the
+   clone cannot perform is hidden rather than left to fail silently. */
+#gridx-mirror-inner [role="group"] { opacity: 0.55; }
+html.gridx-mirror-on #gridx-mirror-inner [data-testid="tweetPhoto"] img,
+html.gridx-mirror-on #gridx-mirror-inner img { max-width: 100%; height: auto; }

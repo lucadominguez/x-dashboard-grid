@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Someone's dev server - not a feed</title>
+<!--
+  A perfectly ordinary app served from localhost, with no data-gridx-site
+  declaration. GridX must not touch it: it used to assume x.com's markup on
+  every localhost page and then announce "could not find the timeline" over
+  the top of whatever was being built.
+-->
+</head>
+<body>
+  <main>
+    <h1>Dashboard</h1>
+    <article><h2>A card that is not a post</h2><p>Local app content.</p></article>
+    <article><h2>Another card</h2><p>Still not a feed.</p></article>
+  </main>
+</body>
+</html>

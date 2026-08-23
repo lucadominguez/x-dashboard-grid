@@ -1,9 +1,33 @@
-# GridX — High-Density X Dashboard
+# GridX - High-Density Feed Dashboard
 
-Turn your logged-in X (twitter.com) tab into a high-density, multi-column
-**grid dashboard** for scanning dozens of posts at once. It **columnizes X's own
-timeline in place** via CSS — it does **not** call the X API, read cookies,
-write anything, or fetch anything X wouldn't (see [RESEARCH.md](./RESEARCH.md)).
+Turn **X (twitter.com)** and **Reddit** into a high-density, multi-column
+**grid dashboard** for scanning dozens of posts at once. It **columnizes the
+site's own feed in place** via CSS - it does **not** call any site API, read
+cookies, write anything, or fetch anything the site wouldn't (see
+[RESEARCH.md](./RESEARCH.md)).
+
+## Supported sites
+
+| Site | Feed container | Post element | Permalink from |
+|---|---|---|---|
+| X / twitter.com | timeline scroller | `article[data-testid="tweet"]` | `a[href*="/status/"]` |
+| reddit.com | `shreddit-feed` | `shreddit-post`, `shreddit-ad-post` | `permalink` attribute |
+| old.reddit.com | site table | `.thing.link` | `data-permalink` |
+
+Everything site-specific lives in one `SITES` table at the top of
+`src/content/content.js`: which element is a post, where its permalink comes
+from, how to spot an ad, whether the feed or the document owns the scroll, and
+which filler elements to ignore. Adding a site means adding one entry there -
+the rest of GridX is site-agnostic.
+
+Two differences that matter, both found by testing against the live sites:
+
+- **Reddit scrolls the document; X scrolls the feed container.** GridX only
+  takes over scrolling where the feed is the scroller. Locking `overflow` on
+  Reddit freezes the page and strands its infinite-scroll sentinel.
+- **Reddit puts an `<hr>` between every entry** (28 posts among 70 children),
+  so separators are excluded from feed detection and hidden in the grid rather
+  than each taking a cell.
 
 **GridX is read-only and "assistive-view":** it never calls the X API, never
 reads cookies, never writes (no auto-like/RT/follow), never auto-scrolls, and
@@ -52,6 +76,24 @@ the posts you've already loaded into multiple columns.
 
 > For an installable `.crx`/store build, zip the folder contents and upload to
 > the Chrome Web Store.
+
+## Tests
+
+```bash
+# fixtures (deterministic, no network)
+cd test && python3 -m http.server 8731 &
+python3 test/live_test.py <ext_dir> http://localhost:8731/fixture.html         x
+python3 test/live_test.py <ext_dir> http://localhost:8731/fixture_reddit.html  reddit
+
+# the original 7-check smoke test
+python3 test/smoke_test.py
+```
+
+`live_test.py` loads the unpacked extension into headful Chromium and drives
+the page the way a person would: land on the feed, scroll, click a post,
+navigate with the keyboard, filter, hide ads, change columns, toggle scan mode,
+and switch GridX off again. It also runs against the real sites by passing a
+live URL instead of a fixture.
 
 ## Keyboard map
 
