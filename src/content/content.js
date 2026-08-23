@@ -52,9 +52,10 @@
   // build is running. Chrome serves an unpacked extension's content script
   // from its own cache, so an edit on disk is not necessarily the code in the
   // tab - a whole debugging session was spent measuring the old build.
-  const BUILD = '0.3.0+mirror8';
+  const BUILD = '0.3.0+reading1';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
+  const ACTIVITY_KEY = 'gridxActivity';
 
   /* ------------------------------------------------------------------ *
    * Defaults & layered selector candidates (X churns its markup).
@@ -75,6 +76,10 @@
     scanMode: false,
     bleed: false,
     debug: false,
+    // Keep a local record of which posts were read, for how long, and which
+    // ones were acted on. It never leaves this machine: it lives in the
+    // extension's own storage and is read back by the options page.
+    trackReading: true,
   };
 
   /* ------------------------------------------------------------------ *
@@ -777,6 +782,7 @@
     if (mirror.obs) mirror.obs.disconnect();
     if (mirror.sizes) mirror.sizes.disconnect();
     if (mirror.modalTimer) clearInterval(mirror.modalTimer);
+    stopDwell();
     if (catchupTimer) { clearTimeout(catchupTimer); catchupTimer = null; }
     document.removeEventListener('scroll', mirror.onScroll, { capture: true });
     window.removeEventListener('resize', mirror.onResize);
@@ -1056,6 +1062,7 @@
     next.classList.add('gx-mirror-cell');
     mirror.keyOf.set(next, key);
     fitMedia(next);
+    watchDwell(next, key);
     next.__gxRefresh = tries + 1;
     next.__gxBorn = clone.__gxBorn || Date.now();
     // On the element, so the cost of the catching-up is visible from outside:
@@ -1164,6 +1171,8 @@
       clone.classList.add('gx-mirror-cell');
       mirror.keyOf.set(clone, key);
       fitMedia(clone);
+      noteSeen(art, key);
+      watchDwell(clone, key);
       mirror.seen.set(key, clone);
       mirror.order.push(key);
       scheduleCatchup();
@@ -1442,6 +1451,13 @@
    * Per-article markings + filters (no re-parenting, no removal)
    * ------------------------------------------------------------------ */
   function markArticle(a) {
+    try {
+      if (!a.__gxLogged) {
+        a.__gxLogged = true;
+        const url = SITE ? SITE.permalink(a) : '';
+        if (url) { noteSeen(a, url); watchDwell(a, url); }
+      }
+    } catch (e) {}
     if (!a.dataset.gxUrl) {
       const url = SITE ? SITE.permalink(a) : '';
       if (url) a.dataset.gxUrl = url;
@@ -1810,6 +1826,7 @@
     if (cell) {
       const act = actionAt(e.target);
       if (act && forwardAction(cell, act)) {
+        noteAction(cell.dataset.gxUrl || '', act);
         e.preventDefault();
         e.stopPropagation();
         return;
@@ -1823,12 +1840,14 @@
       if (link) {
         const href = link.getAttribute('href') || '';
         if (!href || href.charAt(0) === '#') return;
+        noteLink(own, link.href);
         e.preventDefault();
         e.stopPropagation();
         openTab(link.href);
         return;
       }
       if (!own) return;
+      noteOpen(own);
       e.preventDefault();
       e.stopPropagation();
       openTab(own);
@@ -1843,6 +1862,7 @@
     if (!art) return;
     const url = art.dataset.gxUrl || (SITE ? SITE.permalink(art) : '');
     if (!url) return;
+    noteOpen(url);
     e.preventDefault();
     openTab(url);
   }
@@ -2139,6 +2159,236 @@
   }
 
   /* ------------------------------------------------------------------ *
+   * Reading log.
+   *
+   * What the reader actually looked at, on this machine only. Three signals,
+   * and the middle one is the one worth having:
+   *
+   *   seen   - the post reached the grid at all (the denominator)
+   *   dwell  - how long it was genuinely on screen: counted only while the
+   *            tab is visible and at least half the cell is in view
+   *   opened - the reader clicked it, liked it, reposted it or followed one of
+   *            its links, and how long they then spent on the post's own page
+   *
+   * Attention is the interesting measure, because everything gets seen and
+   * almost nothing gets read. Records are keyed by permalink and written to
+   * storage as DELTAS, so several open tabs cannot overwrite each other.
+   * ------------------------------------------------------------------ */
+  const LOG_CAP = 4000;                 // posts kept before the oldest go
+  const FLUSH_MS = 5000;
+  const DWELL_MIN_MS = 400;             // less than this is a post scrolling past
+  const DWELL_MAX_MS = 15 * 60 * 1000;  // a tab left open is not reading
+
+  let pending = new Map();   // id -> the delta this tab has not written yet
+  const meta = new Map();    // id -> what the post is (author, media, text)
+  const dwellStart = new Map();
+  let flushTimer = null;
+
+  const tracking = () => settings.trackReading !== false;
+
+  function postId(url) {
+    if (!url) return '';
+    const x = String(url).match(/\/status\/(\d+)/);
+    if (x) return 'x:' + x[1];
+    const r = String(url).match(/\/comments\/([a-z0-9]+)/i);
+    if (r) return 'r:' + r[1];
+    return '';
+  }
+
+  function delta(id) {
+    let d = pending.get(id);
+    if (!d) {
+      d = { seen: 0, dwellMs: 0, opens: 0, reads: 0, readMs: 0, acts: {}, hosts: {} };
+      pending.set(id, d);
+    }
+    return d;
+  }
+
+  // Read once, when the post is first collected. The click handler should not
+  // be walking a subtree to work out who wrote something.
+  function noteSeen(art, url) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id || meta.has(id)) return;
+    let author = '';
+    let media = 0;
+    let text = '';
+    try {
+      const link = art.querySelector('a[href^="/"]');
+      const m = link && (link.getAttribute('href') || '').match(/^\/([A-Za-z0-9_]+)/);
+      author = m ? m[1] : '';
+      media = art.querySelectorAll(
+        '[data-testid="tweetPhoto"], [data-testid="videoPlayer"], shreddit-aspect-ratio'
+      ).length;
+      // The post's OWN text, not the whole card. textContent runs adjacent
+      // nodes together, so the card gives you the author, the handle and the
+      // timestamp welded onto the first word ("Alice Chen@alice8hpost about
+      // grids"), and those fragments then turn up as your "subjects".
+      const body = art.querySelector('[data-testid="tweetText"], [slot="text-body"], .md, a.title');
+      text = ((body || art).textContent || '').replace(/\s+/g, ' ').trim().slice(0, 160);
+    } catch (e) {}
+    meta.set(id, { a: author, m: media > 0 ? 1 : 0, w: text ? text.split(' ').length : 0, x: text });
+    delta(id).seen = 1;
+    scheduleFlush();
+  }
+
+  function noteOpen(url) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id) return;
+    delta(id).opens++;
+    scheduleFlush();
+  }
+
+  function noteAction(url, act) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id) return;
+    const d = delta(id);
+    d.acts[act] = (d.acts[act] || 0) + 1;
+    scheduleFlush();
+  }
+
+  function noteLink(url, href) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id) return;
+    let host = '';
+    try { host = new URL(href, location.origin).hostname.replace(/^www\./, ''); } catch (e) {}
+    if (!host || host === location.hostname) return;
+    const d = delta(id);
+    d.hosts[host] = (d.hosts[host] || 0) + 1;
+    scheduleFlush();
+  }
+
+  function dwellIn(id) {
+    if (!tracking() || !id || dwellStart.has(id)) return;
+    if (document.visibilityState !== 'visible') return;
+    dwellStart.set(id, Date.now());
+  }
+
+  function dwellOut(id) {
+    const started = dwellStart.get(id);
+    if (!started) return;
+    dwellStart.delete(id);
+    const ms = Date.now() - started;
+    if (ms < DWELL_MIN_MS || ms > DWELL_MAX_MS) return;
+    delta(id).dwellMs += ms;
+    scheduleFlush();
+  }
+
+  function dwellPauseAll() {
+    for (const id of Array.from(dwellStart.keys())) dwellOut(id);
+  }
+
+  // Cells arrive over the whole life of the grid, so the observer is built
+  // once and fed each new one.
+  let dwellObs = null;
+  function watchDwell(cell, url) {
+    if (!tracking()) return;
+    const id = postId(url);
+    if (!id) return;
+    cell.dataset.gxId = id;
+    if (!dwellObs) {
+      const opts = { threshold: [0, 0.5] };
+      if (mirror && mirror.root) opts.root = mirror.root;
+      dwellObs = new IntersectionObserver((entries) => {
+        for (const e of entries) {
+          const k = e.target.dataset.gxId;
+          if (!k) continue;
+          if (e.isIntersecting && e.intersectionRatio >= 0.5) dwellIn(k);
+          else dwellOut(k);
+        }
+      }, opts);
+    }
+    try { dwellObs.observe(cell); } catch (e) {}
+  }
+
+  function stopDwell() {
+    dwellPauseAll();
+    if (dwellObs) { dwellObs.disconnect(); dwellObs = null; }
+  }
+
+  function scheduleFlush() {
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => { flushTimer = null; flushActivity(); }, FLUSH_MS);
+  }
+
+  async function flushActivity() {
+    if (!pending.size) return;
+    const mine = pending;
+    pending = new Map();
+    try {
+      const store = await chrome.storage.local.get(ACTIVITY_KEY);
+      const data = store[ACTIVITY_KEY] || { v: 1, posts: {} };
+      if (!data.posts) data.posts = {};
+      const now = Date.now();
+      for (const [id, d] of mine) {
+        let rec = data.posts[id];
+        if (!rec) {
+          rec = { t: now, a: '', m: 0, w: 0, x: '', seen: 0, dwellMs: 0, opens: 0,
+                  reads: 0, readMs: 0, acts: {}, hosts: {} };
+          data.posts[id] = rec;
+        }
+        const info = meta.get(id);
+        if (info && !rec.a) { rec.a = info.a; rec.m = info.m; rec.w = info.w; rec.x = info.x; }
+        rec.seen += d.seen;
+        rec.dwellMs += d.dwellMs;
+        rec.opens += d.opens;
+        rec.reads += d.reads;
+        rec.readMs += d.readMs;
+        for (const k of Object.keys(d.acts)) rec.acts[k] = (rec.acts[k] || 0) + d.acts[k];
+        for (const k of Object.keys(d.hosts)) rec.hosts[k] = (rec.hosts[k] || 0) + d.hosts[k];
+        rec.last = now;
+      }
+      const ids = Object.keys(data.posts);
+      if (ids.length > LOG_CAP) {
+        ids.sort((a, b) => (data.posts[a].last || data.posts[a].t || 0) -
+                           (data.posts[b].last || data.posts[b].t || 0));
+        for (let i = 0; i < ids.length - LOG_CAP; i++) delete data.posts[ids[i]];
+      }
+      await chrome.storage.local.set({ [ACTIVITY_KEY]: data });
+    } catch (e) {
+      // Put the deltas back rather than lose the counting.
+      for (const [id, d] of mine) {
+        const cur = pending.get(id);
+        if (!cur) { pending.set(id, d); continue; }
+        cur.seen += d.seen; cur.dwellMs += d.dwellMs; cur.opens += d.opens;
+        cur.reads += d.reads; cur.readMs += d.readMs;
+      }
+    }
+  }
+
+  // Time spent on a post's own page. GridX does not grid a permalink view, but
+  // it is loaded there, and how long a post held the reader once they opened
+  // it is the strongest signal of the lot.
+  function startReadTimer() {
+    const id = postId(location.href);
+    if (!id || !tracking()) return;
+    let since = document.visibilityState === 'visible' ? Date.now() : 0;
+    const stop = () => {
+      if (!since) return;
+      const ms = Date.now() - since;
+      since = 0;
+      if (ms < DWELL_MIN_MS || ms > DWELL_MAX_MS) return;
+      const d = delta(id);
+      d.readMs += ms;
+      d.reads = 1;
+      flushActivity();
+    };
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') { if (!since) since = Date.now(); }
+      else stop();
+    });
+    window.addEventListener('pagehide', stop);
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') { dwellPauseAll(); flushActivity(); }
+  });
+  window.addEventListener('pagehide', () => { dwellPauseAll(); flushActivity(); });
+
+  /* ------------------------------------------------------------------ *
    * Messaging (chrome.runtime + DOM custom events)
    * ------------------------------------------------------------------ */
   function applyMessage(detail) {
@@ -2172,6 +2422,7 @@
     try {
       chrome.runtime.onMessage.addListener((msg, _s, sendResponse) => {
         if (!msg || typeof msg !== 'object') return;
+        if (msg.type === 'gridx:flushActivity') { flushActivity().then(() => sendResponse({ ok: true })); return true; }
         if (msg.type === 'gridx:update') { applyMessage(msg.settings || {}); sendResponse({ ok: true }); }
         else if (msg.type === 'gridx:command') { handleCommand(msg.payload); sendResponse({ ok: true }); }
         else if (msg.type === 'gridx:getState') { sendResponse(getState()); }
@@ -2350,6 +2601,9 @@
     await loadSettings();
     registerMessaging();
     startRouteWatch();
+    // A permalink view is not a feed, so the grid stays off - but this is
+    // exactly where "how long did that post hold you" is answered.
+    startReadTimer();
     if (isFeedRoute()) activate();
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init);

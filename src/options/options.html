@@ -89,6 +89,39 @@
     </section>
 
     <section class="card">
+      <h2>What you actually read <span class="tag">stays on this machine</span></h2>
+      <label class="check">
+        <input id="gx-trackReading" type="checkbox" /> Keep a reading log
+      </label>
+      <p class="hint">
+        GridX counts how long each post was really on your screen, which ones you
+        opened, and what you did with them. Nothing is sent anywhere: it is stored
+        in the extension and read back here.
+      </p>
+
+      <div id="gx-read-empty" class="hint">No reading logged yet. Scroll a feed and come back.</div>
+
+      <div id="gx-read-body" hidden>
+        <div class="statgrid" id="gx-read-totals"></div>
+
+        <h3>Accounts that hold you</h3>
+        <table class="lead" id="gx-read-authors"></table>
+
+        <h3>Subjects that hold you</h3>
+        <table class="lead" id="gx-read-words"></table>
+
+        <h3>Longest reads</h3>
+        <table class="lead" id="gx-read-posts"></table>
+
+        <div class="rowbtns">
+          <button id="gx-read-refresh" class="btn">Refresh</button>
+          <button id="gx-read-export" class="btn">Export JSON</button>
+          <button id="gx-read-clear" class="btn danger">Erase the log</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>Extra CSS <span class="tag">advanced</span></h2>
       <textarea id="gx-extra-css" rows="6" spellcheck="false"
         placeholder="CSS appended to the grid, e.g.&#10;.gx-cell { border-radius: 0; }"></textarea>

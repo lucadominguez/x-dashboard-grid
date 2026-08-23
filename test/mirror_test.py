@@ -270,6 +270,66 @@ def main():
             total = sum(lt)
             check('4. scrolling stays responsive (no task > 200ms)', worst <= 200,
                   'long tasks: %d, worst %dms, total %dms' % (len(lt), worst, total))
+            # The reading log: attention has to be counted for the posts
+            # that were actually on screen, and the click has to be recorded
+            # against the post that was clicked.
+            page.wait_for_timeout(6000)   # let a flush land
+            # chrome.storage is not reachable from the page's own world, so
+            # the log is read where it lives: the extension's service worker.
+            sw = (browser.service_workers[0] if browser.service_workers
+                  else browser.wait_for_event('serviceworker'))
+            log = sw.evaluate(
+                "(async () => {"
+                " const store = await chrome.storage.local.get('gridxActivity');"
+                " const posts = (store.gridxActivity || {}).posts || {};"
+                " const all = Object.values(posts);"
+                " return {"
+                "  n: all.length,"
+                "  withDwell: all.filter(r => r.dwellMs > 0).length,"
+                "  opened: all.filter(r => r.opens > 0).length,"
+                "  authors: all.filter(r => r.a).length,"
+                "  text: all.filter(r => r.x).length,"
+                "  maxDwell: all.reduce((m, r) => Math.max(m, r.dwellMs), 0),"
+                " }; })()")
+            check('9. the reading log counted attention',
+                  log['n'] > 20 and log['withDwell'] > 0 and log['opened'] > 0,
+                  str(log))
+            check('9b. it knows whose post it was',
+                  log['authors'] > 0 and log['text'] > 0, str(log))
+
+            # The options page: it reads the log back, and its own controls
+            # work. A null lookup in wire() used to throw and take every
+            # listener registered after it with it - Apply, Reset, both preset
+            # pickers and all six content checkboxes did nothing at all.
+            ext = sw.url.split('/')[2]
+            opts = browser.new_page()
+            errors = []
+            opts.on('pageerror', lambda e: errors.append(str(e)[:160]))
+            opts.goto('chrome-extension://%s/src/options/options.html' % ext)
+            opts.wait_for_timeout(2000)
+            check('10. the options page runs clean', not errors, '; '.join(errors))
+
+            shown = opts.evaluate(
+                "({body: !document.getElementById('gx-read-body').hidden,"
+                "  totals: document.getElementById('gx-read-totals').children.length,"
+                "  authors: document.getElementById('gx-read-authors').rows.length,"
+                "  posts: document.getElementById('gx-read-posts').rows.length})")
+            check('10b. it shows the reading back',
+                  shown['body'] and shown['totals'] >= 6 and shown['authors'] > 0
+                  and shown['posts'] > 0, str(shown))
+
+            before = opts.evaluate(
+                "(async () => ((await chrome.storage.local.get('gridxSettings'))"
+                ".gridxSettings || {}).showMetrics)")
+            opts.click('#gx-showMetrics')
+            opts.wait_for_timeout(400)
+            after = opts.evaluate(
+                "(async () => ((await chrome.storage.local.get('gridxSettings'))"
+                ".gridxSettings || {}).showMetrics)")
+            check('10c. a content checkbox actually saves',
+                  bool(after) != bool(before), '%s -> %s' % (before, after))
+            opts.close()
+
             # An ordinary app served from localhost is none of GridX's
             # business unless it says so.
             page.goto('http://%s:%d/fixture_plain_app.html' % (HOST, PORT))
