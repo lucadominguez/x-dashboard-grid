@@ -52,7 +52,7 @@
   // build is running. Chrome serves an unpacked extension's content script
   // from its own cache, so an edit on disk is not necessarily the code in the
   // tab - a whole debugging session was spent measuring the old build.
-  const BUILD = '0.3.0+mirror5';
+  const BUILD = '0.3.0+mirror6';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
 
@@ -686,7 +686,8 @@
     inner.classList.add('gx-stream');
     root.appendChild(inner);
     document.body.appendChild(root);
-    mirror = { root: root, inner: inner, seen: new Map(), order: [], main: main };
+    mirror = { root: root, inner: inner, seen: new Map(), order: [],
+               keyOf: new WeakMap(), main: main };
     mirror.pinned = pinnedBottom();
     positionMirror();
     applyMirrorColumns();
@@ -728,6 +729,22 @@
       mirror.top = null;
       positionMirror(); applyMirrorColumns(); scheduleMirror(true);
     }, { passive: true });
+    // X opens its reply composer, its photo viewer and its post menu as a
+    // dialog over the timeline, and the overlay sits above everything at
+    // z-index 9998 - it would cover them, leaving the reader typing into
+    // something they cannot see. Step aside while one is open. A quarter of a
+    // second of polling costs one querySelector; the dialog is portalled deep
+    // inside X's tree, so there is no cheap node to observe instead.
+    mirror.modalTimer = setInterval(() => {
+      let open = false;
+      try {
+        const d = document.querySelector('[aria-modal="true"]');
+        open = !!(d && d.getBoundingClientRect().width > 100);
+      } catch (e) {}
+      if (open === mirror.modalOpen) return;
+      mirror.modalOpen = open;
+      mirror.root.style.visibility = open ? 'hidden' : '';
+    }, 250);
     setStatus('GridX: mirroring ' + (SITE ? SITE.label : 'this feed')
       + ' - scroll as usual and posts collect into the grid', 6000);
   }
@@ -736,6 +753,7 @@
     if (!mirror) return;
     if (mirror.obs) mirror.obs.disconnect();
     if (mirror.sizes) mirror.sizes.disconnect();
+    if (mirror.modalTimer) clearInterval(mirror.modalTimer);
     document.removeEventListener('scroll', mirror.onScroll, { capture: true });
     window.removeEventListener('resize', mirror.onResize);
     try { mirror.root.remove(); } catch (e) {}
@@ -944,13 +962,14 @@
     return false;
   }
 
-  function refreshClone(clone, art, key) {
+  function refreshClone(clone, art, key, force) {
     const tries = clone.__gxRefresh || 0;
-    if (tries >= REFRESH_LIMIT) return false;
-    if (!staleClone(clone, art)) return false;
+    if (!force && tries >= REFRESH_LIMIT) return false;
+    if (!force && !staleClone(clone, art)) return false;
     let next;
     try { next = art.cloneNode(true); } catch (e) { return false; }
     next.classList.add('gx-mirror-cell');
+    mirror.keyOf.set(next, key);
     fitMedia(next);
     next.__gxRefresh = tries + 1;
     if (clone.dataset.gxUrl) next.dataset.gxUrl = clone.dataset.gxUrl;
@@ -963,6 +982,62 @@
     heights.delete(next);
     mirror.seen.set(key, next);
     if (mirror.sizes) { try { mirror.sizes.observe(next); } catch (e) {} }
+    return true;
+  }
+
+  // A clone's buttons are dead markup, but the post they were copied from is
+  // often still mounted a few hundred pixels underneath - X keeps a window of
+  // cells around the reader. When it is, a press on the copy is forwarded to
+  // the real button and the like, repost or bookmark actually happens; when it
+  // is not, the post opens instead so the reader can act on it there.
+  const ACTIONS = ['reply', 'retweet', 'unretweet', 'like', 'unlike',
+                   'bookmark', 'removeBookmark'];
+  function actionAt(el) {
+    let n = el;
+    for (let i = 0; i < 8 && n && n.getAttribute; i++) {
+      const t = n.getAttribute('data-testid');
+      if (t && ACTIONS.indexOf(t) >= 0) return t;
+      n = n.parentElement;
+    }
+    return '';
+  }
+
+  function liveArticleFor(key) {
+    if (!host || !key) return null;
+    for (const cell of host.children) {
+      if (!isEl(cell)) continue;
+      let art = null;
+      try { art = cell.matches(ARTICLE) ? cell : cell.querySelector(ARTICLE); } catch (e) { continue; }
+      if (!art) continue;
+      if (cellKey(cell, art) === key) return art;
+    }
+    return null;
+  }
+
+  // like <-> unlike and repost <-> unrepost are the same control in two
+  // states, and the copy can be showing the state from before the press.
+  const TWIN = { like: 'unlike', unlike: 'like', retweet: 'unretweet',
+                 unretweet: 'retweet', bookmark: 'removeBookmark',
+                 removeBookmark: 'bookmark' };
+  function forwardAction(clone, act) {
+    if (!mirror) return false;
+    const key = mirror.keyOf.get(clone);
+    const live = liveArticleFor(key);
+    if (!live) return false;
+    let btn = null;
+    try {
+      btn = live.querySelector('[data-testid="' + act + '"]') ||
+            (TWIN[act] ? live.querySelector('[data-testid="' + TWIN[act] + '"]') : null);
+    } catch (e) { return false; }
+    if (!btn) return false;
+    btn.click();
+    // The copy still shows the count and the state from before the press.
+    setTimeout(() => {
+      if (!mirror) return;
+      const again = liveArticleFor(key);
+      const cur = mirror.seen.get(key);
+      if (again && cur) { refreshClone(cur, again, key, true); scheduleMirror(true); }
+    }, 500);
     return true;
   }
 
@@ -998,6 +1073,7 @@
       try { clone = art.cloneNode(true); } catch (e) { continue; }
       if (key.indexOf('txt:') !== 0) clone.dataset.gxUrl = key;
       clone.classList.add('gx-mirror-cell');
+      mirror.keyOf.set(clone, key);
       fitMedia(clone);
       mirror.seen.set(key, clone);
       mirror.order.push(key);
@@ -1586,8 +1662,26 @@
     // still act for itself here; everything else opens the post.
     const cell = e.target.closest && e.target.closest('.gx-mirror-cell');
     if (cell) {
-      if (e.target.closest('a[href]')) return;
+      const act = actionAt(e.target);
+      if (act && forwardAction(cell, act)) {
+        e.preventDefault();
+        e.stopPropagation();
+        return;
+      }
       const own = cell.dataset.gxUrl || (SITE ? SITE.permalink(cell) : '');
+      // Even a real link goes to a new tab from inside the grid. Following one
+      // in place threw the collection away - the reader came back to a feed
+      // that had started over, because X rebuilds its timeline from the top
+      // and the mirror begins again with it.
+      const link = e.target.closest('a[href]');
+      if (link) {
+        const href = link.getAttribute('href') || '';
+        if (!href || href.charAt(0) === '#') return;
+        e.preventDefault();
+        e.stopPropagation();
+        openTab(link.href);
+        return;
+      }
       if (!own) return;
       e.preventDefault();
       e.stopPropagation();

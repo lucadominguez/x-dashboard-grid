@@ -164,6 +164,50 @@ def main():
                 opened = 'no tab opened (%s: %s)' % (type(exc).__name__, str(exc)[:90])
             check('5. clicking a post opens it', '/status/' in opened, opened)
 
+            # A press on a copy's like button reaches the real post whenever
+            # that post is still mounted underneath.
+            liked = page.evaluate(
+                "(() => {"
+                " window.__likes = [];"
+                " const m = document.getElementById('gridx-mirror').getBoundingClientRect();"
+                " const live = new Set();"
+                " for (const c of document.querySelectorAll('[data-testid=\"cellInnerDiv\"]')) {"
+                "  const l = c.querySelector('a[href*=\"/status/\"]');"
+                "  if (l) live.add(l.href);"
+                " }"
+                " for (const c of document.querySelectorAll('.gx-mirror-cell')) {"
+                "  if (!live.has(c.dataset.gxUrl)) continue;"
+                "  const r = c.getBoundingClientRect();"
+                "  if (r.top < m.top || r.bottom > m.bottom) continue;"
+                "  const b = c.querySelector('[data-testid=\"like\"]');"
+                "  if (!b) continue;"
+                "  const before = b.textContent;"
+                "  b.click();"
+                "  return {clicked: true, before: before, landed: window.__likes.length};"
+                " } return {clicked: false}; })()")
+            check('5b. a like on a copy reaches the real post',
+                  bool(liked.get('clicked')) and liked.get('landed', 0) > 0,
+                  str(liked))
+
+            # Following a link inside the grid IN PLACE threw the collection
+            # away: X rebuilds its timeline from the top and the mirror starts
+            # over with it, so the reader came back to a feed they had never
+            # seen. Links from inside the grid open a tab of their own.
+            was = page.url
+            stayed = ''
+            try:
+                with browser.expect_page(timeout=5000) as popup:
+                    page.evaluate(
+                        "document.querySelector('.gx-mirror-cell a[href]').click()")
+                stayed = popup.value.url
+                popup.value.close()
+            except Exception as exc:
+                stayed = 'no tab opened (%s)' % type(exc).__name__
+            page.wait_for_timeout(300)
+            check('5c. a link in the grid keeps the feed tab',
+                  page.url == was and stayed.startswith('http'),
+                  'feed still at %s, link opened %s' % (page.url.split('/')[-1], stayed))
+
             # Asking for more columns than the comfortable width allows used to
             # be capped in silence; a narrow column is scaled now instead.
             page.evaluate(

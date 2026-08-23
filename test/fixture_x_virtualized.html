@@ -87,8 +87,10 @@ function cell(i) {
         (lateText(i) ? '' : ' - ' + BODIES[i % BODIES.length]) + '</div>' +
       '<a href="/' + h + '/status/' + (100000 + i) + '"><time>now</time></a>' +
       '<div role="group">' +
-        '<div data-testid="reply">12</div><div data-testid="retweet">34</div>' +
-        '<div data-testid="like">56</div><div data-testid="viewCount">1700</div>' +
+        '<div data-testid="reply" role="button" tabindex="0">12</div>' +
+        '<div data-testid="retweet" role="button" tabindex="0">34</div>' +
+        '<div data-testid="like" role="button" tabindex="0">56</div>' +
+        '<div data-testid="viewCount">1700</div>' +
       '</div>' +
     '</article>';
   // X mounts the SHELL of a post first and fills the avatar and any photo in
@@ -128,6 +130,17 @@ function cell(i) {
   }, 520);
   return c;
 }
+
+// The real buttons do something, so a copy's dead button has something to be
+// forwarded TO. window.__likes records every like the page actually received.
+window.__likes = [];
+document.addEventListener('click', (e) => {
+  const b = e.target.closest && e.target.closest('[data-testid="like"]');
+  if (!b) return;
+  const cell = b.closest('[data-testid="cellInnerDiv"]');
+  b.textContent = String((+b.textContent || 0) + 1);
+  window.__likes.push(cell ? cell.dataset.idx : '?');
+});
 
 // X keeps only a window of cells mounted and moves them as you scroll.
 let mounted = new Map();
