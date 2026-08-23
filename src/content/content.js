@@ -169,9 +169,15 @@
     if (byHost) return byHost;
     // Local fixtures declare which site's markup they emulate:
     //   <html data-gridx-site="reddit">
+    //
+    // The declaration is REQUIRED. Defaulting to x.com's markup meant GridX
+    // woke up on every page served from localhost - somebody's dev server on
+    // :3080 among them - looked for a timeline that was never going to be
+    // there, and put "GridX: could not find the timeline" across their app.
     if (/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
-      const want = (document.documentElement.getAttribute('data-gridx-site') || 'x').toLowerCase();
-      return SITES.find((s) => s.id === want) || SITES[0];
+      const want = (document.documentElement.getAttribute('data-gridx-site') || '').toLowerCase();
+      if (!want) return null;
+      return SITES.find((s) => s.id === want) || null;
     }
     return null;
   }

@@ -270,6 +270,19 @@ def main():
             total = sum(lt)
             check('4. scrolling stays responsive (no task > 200ms)', worst <= 200,
                   'long tasks: %d, worst %dms, total %dms' % (len(lt), worst, total))
+            # An ordinary app served from localhost is none of GridX's
+            # business unless it says so.
+            page.goto('http://%s:%d/fixture_plain_app.html' % (HOST, PORT))
+            page.wait_for_timeout(4000)
+            quiet = page.evaluate(
+                "({cls: document.documentElement.className,"
+                "  overlay: !!document.getElementById('gridx-root'),"
+                "  mirror: !!document.getElementById('gridx-mirror'),"
+                "  says: /GridX/.test(document.body.innerText)})")
+            check('8. a plain localhost app is left alone',
+                  not quiet['overlay'] and not quiet['mirror']
+                  and not quiet['says'] and 'gridx' not in quiet['cls'],
+                  str(quiet))
     finally:
         try:
             if browser:
