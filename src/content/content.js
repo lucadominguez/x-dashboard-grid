@@ -52,7 +52,7 @@
   // build is running. Chrome serves an unpacked extension's content script
   // from its own cache, so an edit on disk is not necessarily the code in the
   // tab - a whole debugging session was spent measuring the old build.
-  const BUILD = '0.3.0+mirror4';
+  const BUILD = '0.3.0+mirror5';
   const STORAGE_KEY = 'gridxSettings';
   const STATS_KEY = 'gridxStats';
 
@@ -918,15 +918,36 @@
   }
 
   const REFRESH_LIMIT = 4;
+
+  // Is the copy behind the post it came from? Pictures were the obvious case,
+  // but TEXT arrives late too: measured on the live feed, a promoted post
+  // whose clone held 37 characters while the post itself had grown to 79 - the
+  // reader sees a cell with a line and a half and an action row, and nothing
+  // else. Image count alone cannot see that, since both had exactly one.
+  function staleClone(clone, art) {
+    let liveImgs = 0, mineImgs = 0, liveLen = 0, mineLen = 0;
+    try {
+      liveImgs = art.querySelectorAll('img').length;
+      mineImgs = clone.querySelectorAll('img').length;
+      liveLen = (art.textContent || '').length;
+      mineLen = (clone.textContent || '').length;
+    } catch (e) { return false; }
+    if (liveImgs > mineImgs) return true;
+    // A margin, so a relative timestamp ticking from 8h to 9h or a like count
+    // rolling over does not keep re-cloning a post that is already complete.
+    if (liveLen - mineLen > 12) return true;
+    // A post still spinning when it was copied stays spinning forever.
+    try {
+      if (clone.querySelector('[role="progressbar"]') &&
+          !art.querySelector('[role="progressbar"]')) return true;
+    } catch (e) {}
+    return false;
+  }
+
   function refreshClone(clone, art, key) {
     const tries = clone.__gxRefresh || 0;
     if (tries >= REFRESH_LIMIT) return false;
-    let live = 0, mine = 0;
-    try {
-      live = art.querySelectorAll('img').length;
-      mine = clone.querySelectorAll('img').length;
-    } catch (e) { return false; }
-    if (live <= mine) return false;
+    if (!staleClone(clone, art)) return false;
     let next;
     try { next = art.cloneNode(true); } catch (e) { return false; }
     next.classList.add('gx-mirror-cell');

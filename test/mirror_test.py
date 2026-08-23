@@ -93,6 +93,24 @@ def main():
             check('2. every clone kept its pictures', blank == 0,
                   '%d of %d clones have no <img>' % (blank, clones))
 
+            # A clone taken mid-render must catch up with its source, or the
+            # cell shows a line and a half of a post and an action row.
+            truncated = page.evaluate(
+                "(() => {"
+                " const byKey = new Map();"
+                " for (const c of document.querySelectorAll('.gx-mirror-cell'))"
+                "  byKey.set(c.dataset.gxUrl || '', c.textContent.length);"
+                " let worst = 0;"
+                " for (const cell of document.querySelectorAll('[data-testid=\"cellInnerDiv\"]')) {"
+                "  const a = cell.querySelector('article'); if (!a) continue;"
+                "  const l = a.querySelector('a[href*=\"/status/\"]'); if (!l) continue;"
+                "  const mine = byKey.get(l.href); if (mine === undefined) continue;"
+                "  const gap = a.textContent.length - mine;"
+                "  if (gap > worst) worst = gap;"
+                " } return worst; })()")
+            check('2b. no clone is left behind its post', truncated <= 12,
+                  'worst clone is %d characters short' % truncated)
+
             cols = page.evaluate("""(() => {
                 const inner = document.getElementById('gridx-mirror-inner');
                 const by = {};
