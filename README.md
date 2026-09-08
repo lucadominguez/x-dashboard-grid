@@ -1,26 +1,30 @@
-# GridX — High-Density X Dashboard
+<p align="center"><img src="assets/presentation/banner.png" alt="GridX: more of your X timeline in one scrolling grid" width="900"></p>
 
-Turn your logged-in X (twitter.com) tab into a high-density, multi-column
-**grid dashboard** for scanning dozens of posts at once. It **columnizes X's own
-timeline in place** via CSS — it does **not** call the X API, read cookies,
-write anything, or fetch anything X wouldn't (see [RESEARCH.md](./RESEARCH.md)).
+# GridX
 
-**GridX is read-only and "assistive-view":** it never calls the X API, never
-reads cookies, never writes (no auto-like/RT/follow), never auto-scrolls, and
-never sends a request X itself wouldn't. It just hides X's chrome and re-flows
-the posts you've already loaded into multiple columns.
+GridX turns your existing X timeline into a denser, adjustable grid. It changes
+X's own container in place rather than fetching separate feeds. Use it when
+you want to scan more posts without opening several tabs.
 
-> **Note on architecture (v0.2):** the original build "hoisted" `<article>`
-> nodes out of X's timeline into a custom grid. Live testing on x.com exposed a
-> problem with that approach: emptying the timeline makes X's infinite-scroll
-> sentinel always visible, so X fired dozens of page-loads with no human
-> cadence — producing **temporary rate-limits** and **overlapping icons** (from
-> heavy overrides of X's internals). v0.2 **re-flows X's own container in
-> place** with a CSS grid. X keeps ownership of layout, scroll, pagination,
-> clicks and rendering, which fixes both those problems at the root. See
-> `src/content/content.js` header comment and RESEARCH.md.
+**Experimental Chromium extension.** There is no build step or runtime package
+dependency. X can change its markup, so compatibility needs maintenance.
 
----
+![One timeline, reflowed in place, with adjustable reading controls](assets/presentation/overview.png)
+
+*Architecture illustration, not a capture of a live X session. Editable
+[artwork and rendering instructions](scripts/artwork/README.md) are included.*
+
+## What it does, and what it does not
+
+- Reflows already loaded posts into 1–8 columns with adjustable density and type.
+- Keeps X responsible for its timeline, pagination, rendering and native clicks.
+- Stores extension preferences locally with `chrome.storage.local`.
+- Does not automate likes, reposts, follows or scrolling, and does not use an X API client.
+- Does not provide independent feeds per column or guarantee freedom from platform restrictions.
+
+Version 0.2 replaced the earlier node-hoisting approach with in-place layout.
+The rationale is in [RESEARCH.md](RESEARCH.md). The local Playwright fixture
+checks layout and controls; it is not a live-site or account-safety test.
 
 ## Features
 
@@ -107,7 +111,7 @@ Full-page editor (also reachable via popup → Options):
     children are the tweets. Usually means (a) you're not on a timeline page, or
     (b) X shipped markup changes. Reload the page; if it persists, the layered
     selector logic in `src/content/content.js` (`isStreamHost`/`findHost`) may
-    need updating. GridX never breaks X: it just shows the overlay and stays off.
+    need updating. Disable the extension if X behaves unexpectedly; DOM changes can break compatibility.
 *   **Grid shows one column** — the stream container or X's layout isn't being
     re-flowed (X markup drift). Columns are set inline on the detected
     `[data-gx-stream]` container.
@@ -140,19 +144,21 @@ Full-page editor (also reachable via popup → Options):
     5. `gridx:update {columnCount:4}` → 4 columns
     6. keyword filter hides matching posts
     7. `scanMode:true` → `gridx-scan` on `<html>`
-*   **Icons:** regenerate with `python3 tools/gen_icons.py` (pure stdlib PNG
-    writer, no Pillow).
+*   **Icons:** the checked-in PNG files are under `icons/`.
 
 ## Risk summary
 
-GridX is a **browser-extension / assistive-view** project, not a scraper: zero
-extra X-network calls, zero writes, zero cookie/token access, no auto-scroll, no
-mass fetch, and it requires your own logged-in session. The honest risks are
-**maintenance** (X changes its DOM; the container/`data-testid` selectors may
-need updating) and the **ToS gray zone** shared by all assistive extensions — not
-account banning, because GridX adds no requests and follows your real scroll
-cadence. See **[RESEARCH.md](./RESEARCH.md)** for the full platform/ToS/account
-risk analysis and the list of things GridX deliberately does not build.
+GridX is a layout extension, not an account-automation tool. Its settings do
+write to local extension storage; "read-only" refers to the absence of automated
+account actions, not the absence of all writes. Native X controls still perform
+the actions you click.
+
+Maintenance and platform-policy risks remain. In-place layout is not a promise
+that X will never restrict an account. Read [RESEARCH.md](RESEARCH.md), use your
+own account, and disable the extension if it causes unexpected behavior.
+
+To help, report the affected page type, browser version, and steps to reproduce
+a layout problem. Redact private messages, account identifiers and tokens.
 
 ## License
 
